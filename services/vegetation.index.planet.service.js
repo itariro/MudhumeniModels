@@ -3,7 +3,6 @@ const ee = require('@google/earthengine');
 class VegetationIndexServicePlanet {
     static async calculateIndices(polygon, startDate, endDate) {
         try {
-            // Input validation with detailed logging
             console.log('Input parameters:', {
                 startDate,
                 endDate,
@@ -18,26 +17,40 @@ class VegetationIndexServicePlanet {
             }
 
             const region = ee.Geometry.Polygon(polygon.geometry.coordinates);
+            
+            // Check polygon area
+            const area = region.area(1);
+            const areaInHa = ee.Number(area).divide(10000); // Convert to hectares
 
-            // Get initial collection using SKYSAT
+            // Force computation of area before comparison
+            const actualArea = await areaInHa.getInfo();
+            if (actualArea > 20) { // Simple JavaScript comparison
+                throw new Error(`Polygon area exceeds the allowed limit. ${actualArea} ha provided, 20 ha allowed.`);
+            }
+
             const initialCollection = ee.ImageCollection('SKYSAT/GEN-A/PUBLIC/ORTHO/MULTISPECTRAL')
                 .filterBounds(region);
             const initialSize = await initialCollection.size().getInfo();
             console.log('Initial collection size:', initialSize);
 
-            // Add date filter
             const dateFiltered = initialCollection.filterDate(startDate, endDate);
             const dateFilteredSize = await dateFiltered.size().getInfo();
             console.log('Collection size after date filter:', dateFilteredSize);
 
-            // Sort by date to get the most recent image
-            const planetCollection = dateFiltered.sort('system:time_start', false);
+            // Add cloud masking and quality scoring
+            const processedCollection = dateFiltered
+                .map(function (image) {
+                    const masked = image.updateMask(image.select('quality').lt(2));
+                    return masked.addBands(
+                        ee.Image.constant(image.get('quality')).rename('score')
+                    );
+                })
+                .sort('system:time_start', false);
 
-            const finalSize = await planetCollection.size().getInfo();
+            const finalSize = await processedCollection.size().getInfo();
             console.log('Final collection size:', finalSize);
 
             if (finalSize === 0) {
-                // Provide detailed error message based on filtering results
                 let errorMessage = 'No suitable images found. ';
                 if (initialSize === 0) {
                     errorMessage += 'No images found for the specified region. ';
@@ -48,24 +61,26 @@ class VegetationIndexServicePlanet {
                 throw new Error(errorMessage);
             }
 
-            // Get the first image details for logging
-            const image = planetCollection.first();
+            // Select best image based on quality score
+            const image = processedCollection.first();
             const imageProperties = await image.toDictionary().getInfo();
             console.log('Selected image properties:', {
-                date: imageProperties['system:time_start']
+                date: imageProperties['system:time_start'],
+                quality: imageProperties['quality']
             });
 
-            // Band selection based on SKYSAT specifications
-            // All bands are at 2m resolution except panchromatic at 0.8m
+            // Optimized band selection
+            const requiredBands = ['B', 'G', 'R', 'N', 'P'];
+            const selectedImage = image.select(requiredBands);
+
             const bands = {
-                blue: image.select('B').rename('BLUE'),       // 450-515nm
-                green: image.select('G').rename('GREEN'),     // 515-595nm
-                red: image.select('R').rename('RED'),         // 605-695nm
-                nir: image.select('N').rename('NIR'),         // 740-900nm
-                pan: image.select('P').rename('PAN')          // 450-900nm
+                blue: selectedImage.select('B').rename('BLUE'),
+                green: selectedImage.select('G').rename('GREEN'),
+                red: selectedImage.select('R').rename('RED'),
+                nir: selectedImage.select('N').rename('NIR'),
+                pan: selectedImage.select('P').rename('PAN')
             };
 
-            // Create composite image with all bands
             const compositeBands = ee.Image([
                 bands.blue,
                 bands.green,
@@ -74,8 +89,6 @@ class VegetationIndexServicePlanet {
                 bands.pan
             ]);
 
-            // Index Calculations
-            // Note: Some indices from the original code are removed as they required bands not available in SKYSAT
             const indices = {
                 NDVI: compositeBands.normalizedDifference(['NIR', 'RED']).rename('NDVI'),
                 GNDVI: compositeBands.normalizedDifference(['NIR', 'GREEN']).rename('GNDVI'),
@@ -101,34 +114,50 @@ class VegetationIndexServicePlanet {
                     .subtract(1).rename('CIgreen')
             };
 
-            // Combine all bands and indices
             const imageWithIndices = compositeBands.addBands(Object.values(indices));
 
-            // Calculate statistics at 2m resolution
-            const stats = await imageWithIndices.reduceRegion({
-                reducer: ee.Reducer.mean(),
-                geometry: region,
-                scale: 2, // Using native 2m resolution
-                maxPixels: 1e9,
-                tileScale: 4
-            }).getInfo();
+            // CRUCIAL CHANGE: Use sampleRegion()
+            const samples = imageWithIndices.sampleRegion({
+                collection: ee.FeatureCollection([ee.Feature(region)]), // Important: create a FeatureCollection
+                scale: 3, // 3m resolution
+                geometries: true, // Include geometry with samples
+                projection: image.projection() // Use the image's projection for accuracy
+            });
 
-            // Generate NDVI visualization
+            const sampledData = await samples.getInfo();
+
+            // Process the sampled data client-side
+            const stats = {};
+            const bandNames = imageWithIndices.bandNames().getInfo();
+            bandNames.forEach(band => {
+                const values = sampledData.features.map(feature => feature.properties[band]);
+                stats[band] = {
+                    mean: values.reduce((sum, val) => sum + val, 0) / values.length,
+                    // Add other stats like min, max, stdDev if needed
+                };
+            });
             const mapId = await imageWithIndices.select('NDVI').getMap({
                 min: -1,
                 max: 1,
                 palette: ['red', 'white', 'green']
             });
-
             return {
                 statistics: stats,
                 mapUrl: `https://earthengine.googleapis.com/map/${mapId.mapid}`,
                 timestamp: new Date().toISOString(),
                 imageMetadata: {
                     acquisitionDate: image.get('system:time_start'),
-                    resolution: '2m multispectral, 0.8m panchromatic'
+                    resolution: '2m multispectral, 0.8m panchromatic',
+                    cloudCover: image.get('cloud_cover'),
+                    sunAzimuth: image.get('sun_azimuth'),
+                    sunElevation: image.get('sun_elevation'),
+                    qualityScore: image.get('quality'),
+                    processingLevel: image.get('processing_level'),
+                    spacecraft: image.get('spacecraft'),
+                    orbitNumber: image.get('orbit_number')
                 }
             };
+
         } catch (error) {
             console.error('Error in calculateIndices:', error);
             throw new Error(`Vegetation index calculation failed: ${error.message}`);

@@ -12,7 +12,7 @@ const monitoring = require('./utils/monitoring');
 const config = require('./config/config');
 
 const { initializeEarthEngine } = require('./config/earth.engine');
-const ndviRoutes = require('./routes/vegetation.index.routes');
+const vegetationIndexRoutes = require('./routes/vegetation.index.routes');
 dotenv.config();
 
 const app = express();
@@ -95,7 +95,7 @@ apiV1Router.get('/api-docs', (req, res) => {
                 description: 'Predict yield for given daily data',
                 requiredFields: ['fieldId', 'cropType', 'dailyData']
             },
-            '/ndvi/analyze': {
+            '/vegetation/analyze': {
                 method: 'POST',
                 description: 'Predict yield for given daily data',
                 requiredFields: ['fieldId', 'cropType', 'dailyData']
@@ -178,8 +178,8 @@ const startServer = async () => {
         await initializeEarthEngine();
         console.log('Earth Engine initialized successfully');
 
-        // Mount NDVI routes
-        app.use('/api/v1/ndvi', ndviRoutes);
+        // Mount Vegetation Index Routes
+        app.use('/api/v1/vegetation', vegetationIndexRoutes);
 
         // Additional error handling for Earth Engine routes
         app.use((err, req, res, next) => {

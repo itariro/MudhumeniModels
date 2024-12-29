@@ -4,17 +4,29 @@ const VegetationIndexServicePlanet = require('../services/vegetation.index.plane
 class VegetationIndexController {
     static async analyzeRegion(req, res) {
         try {
-            const { polygon, startDate, endDate } = req.body;
+            const { polygon, startDate, endDate, source } = req.body;
 
-            if (!polygon || !startDate || !endDate) {
+            if (!polygon || !startDate || !endDate || !source) {
                 return res.status(400).json({
                     error: 'Missing required parameters',
-                    message: 'Polygon, start date, and end date are required'
+                    message: 'Polygon, start date, end date, and source are required'
                 });
             }
 
-            // const result = await VegetationIndexServiceSentinet2A.calculateIndices(polygon, startDate, endDate);
-            const result = await VegetationIndexServicePlanet.calculateIndices(polygon, startDate, endDate);
+            let result;
+            switch (source.toLowerCase()) {
+                case 'sentinel2a':
+                    result = await VegetationIndexServiceSentinet2A.calculateIndices(polygon, startDate, endDate);
+                    break;
+                case 'planet':
+                    result = await VegetationIndexServicePlanet.calculateIndices(polygon, startDate, endDate);
+                    break;
+                default:
+                    return res.status(400).json({
+                        error: 'Invalid source',
+                        message: 'Source must be either "sentinel2a" or "planet"'
+                    });
+            }
 
             return res.json(result);
         } catch (error) {
