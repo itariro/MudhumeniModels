@@ -72,6 +72,7 @@ apiV1Router.get('/health', (req, res) => {
 apiV1Router.get('/api-docs', (req, res) => {
     res.json({
         version: '1.0.0',
+        suffix: '/api/v1',
         endpoints: {
             '/health': {
                 method: 'GET',
@@ -90,6 +91,11 @@ apiV1Router.get('/api-docs', (req, res) => {
                 optionalFields: ['k']
             },
             '/predict': {
+                method: 'POST',
+                description: 'Predict yield for given daily data',
+                requiredFields: ['fieldId', 'cropType', 'dailyData']
+            },
+            '/ndvi/analyze': {
                 method: 'POST',
                 description: 'Predict yield for given daily data',
                 requiredFields: ['fieldId', 'cropType', 'dailyData']

@@ -17,6 +17,7 @@ router.post('/analyze', async (req, res, next) => {
     } catch (error) {
         next(error);
     }
+    console.log('Polygon validation passed');
 }, NDVIController.analyzeRegion);
 
 module.exports = router;

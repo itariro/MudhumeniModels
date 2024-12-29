@@ -5,12 +5,18 @@ class NDVIController {
         try {
             const { polygon, startDate, endDate } = req.body;
 
-            const result = await NDVIService.calculateNDVI(polygon, startDate, endDate);
+            if (!polygon || !startDate || !endDate) {
+                return res.status(400).json({
+                    error: 'Missing required parameters',
+                    message: 'Polygon, start date, and end date are required'
+                });
+            }
 
-            res.json(result);
+            const result = await NDVIService.calculateNDVI(polygon, startDate, endDate);
+            return res.json(result);
         } catch (error) {
             console.error('NDVI Analysis Error:', error);
-            res.status(500).json({
+            return res.status(500).json({
                 error: 'Failed to process NDVI analysis',
                 message: error.message
             });
