@@ -1,4 +1,4 @@
-const VegetationIndexService = require('../config/ndvi.service');
+const VegetationIndexService = require('../services/vegetation.index.service');
 
 class VegetationIndexController {
     static async analyzeRegion(req, res) {

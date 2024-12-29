@@ -6,13 +6,13 @@ const morgan = require('morgan');
 const uuid = require('uuid');
 const dotenv = require('dotenv');
 const YieldPredictionModel = require('./models/yield.predition.model');
-const { validateRequest } = require('./middleware/validation');
+const { validateRequest } = require('./middleware/request.validator');
 const errorHandler = require('./middleware/error.handler');
 const monitoring = require('./utils/monitoring');
 const config = require('./config/config');
 
 const { initializeEarthEngine } = require('./config/earth.engine');
-const ndviRoutes = require('./routes/ndvi.routes');
+const ndviRoutes = require('./routes/vegetation.index.routes');
 dotenv.config();
 
 const app = express();

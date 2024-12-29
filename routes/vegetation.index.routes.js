@@ -1,6 +1,6 @@
 const express = require('express');
 const { polygonSchema } = require('../middleware/polygon.validator');
-const NDVIController = require('../controllers/ndvi.controller');
+const NDVIController = require('../controllers/vegetation.index.controller');
 
 const router = express.Router();
 
