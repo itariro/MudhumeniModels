@@ -1,6 +1,6 @@
-const NDVIService = require('../config/ndvi.service');
+const VegetationIndexService = require('../config/ndvi.service');
 
-class NDVIController {
+class VegetationIndexController {
     static async analyzeRegion(req, res) {
         try {
             const { polygon, startDate, endDate } = req.body;
@@ -12,7 +12,7 @@ class NDVIController {
                 });
             }
 
-            const result = await NDVIService.calculateNDVI(polygon, startDate, endDate);
+            const result = await VegetationIndexService.calculateIndices(polygon, startDate, endDate);
             return res.json(result);
         } catch (error) {
             console.error('NDVI Analysis Error:', error);
@@ -24,4 +24,4 @@ class NDVIController {
     }
 }
 
-module.exports = NDVIController;
+module.exports = VegetationIndexController;
