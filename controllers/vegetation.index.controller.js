@@ -1,4 +1,5 @@
-const VegetationIndexService = require('../services/vegetation.index.service');
+const VegetationIndexServiceSentinet2A = require('../services/vegetation.index.sentinel.service');
+const VegetationIndexServicePlanet = require('../services/vegetation.index.planet.service');
 
 class VegetationIndexController {
     static async analyzeRegion(req, res) {
@@ -12,12 +13,14 @@ class VegetationIndexController {
                 });
             }
 
-            const result = await VegetationIndexService.calculateIndices(polygon, startDate, endDate);
+            // const result = await VegetationIndexServiceSentinet2A.calculateIndices(polygon, startDate, endDate);
+            const result = await VegetationIndexServicePlanet.calculateIndices(polygon, startDate, endDate);
+
             return res.json(result);
         } catch (error) {
-            console.error('NDVI Analysis Error:', error);
+            console.error('Vegetation Index Analysis Error:', error);
             return res.status(500).json({
-                error: 'Failed to process NDVI analysis',
+                error: 'Failed to process Vegetation Index analysis',
                 message: error.message
             });
         }

@@ -1,6 +1,6 @@
 const express = require('express');
 const { polygonSchema } = require('../middleware/polygon.validator');
-const NDVIController = require('../controllers/vegetation.index.controller');
+const vegetationIndexController = require('../controllers/vegetation.index.controller');
 
 const router = express.Router();
 
@@ -17,7 +17,6 @@ router.post('/analyze', async (req, res, next) => {
     } catch (error) {
         next(error);
     }
-    console.log('Polygon validation passed');
-}, NDVIController.analyzeRegion);
+}, vegetationIndexController.analyzeRegion);
 
 module.exports = router;

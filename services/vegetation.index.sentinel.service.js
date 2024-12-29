@@ -1,6 +1,6 @@
 const ee = require('@google/earthengine');
 
-class VegetationIndexService {
+class VegetationIndexServiceSentinel2A {
     static async calculateIndices(polygon, startDate, endDate) {
         try {
             // Input validation with detailed logging
@@ -20,6 +20,7 @@ class VegetationIndexService {
             const region = ee.Geometry.Polygon(polygon.geometry.coordinates);
 
             // Get initial collection size before filtering
+            // Harmonized Sentinel-2 MSI: MultiSpectral Instrument, Level-2A
             const initialCollection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                 .filterBounds(region);
             const initialSize = await initialCollection.size().getInfo();
@@ -175,4 +176,4 @@ class VegetationIndexService {
     }
 }
 
-module.exports = VegetationIndexService;
+module.exports = VegetationIndexServiceSentinel2A;
