@@ -4,39 +4,44 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
 const uuid = require('uuid');
-const YieldPredictionModel = require('./yield-predition-model');
+const YieldPredictionModel = require('./models/yield.predition.model');
 const { validateRequest } = require('./middleware/validation');
-const errorHandler = require('./middleware/error-handler');
+const errorHandler = require('./middleware/error.handler');
 const monitoring = require('./utils/monitoring');
-const config = require('./config');
+const config = require('./config/config');
+
+const { initializeEarthEngine } = require('./config/earth.engine');
+const ndviRoutes = require('./routes/ndvi.routes');
+dotenv.config();
 
 const app = express();
+const apiV1Router = express.Router();
 
-// Security middleware
+// Security middleware configuration
 app.use(helmet());
 app.use(cors({
     origin: config.cors.origins,
     methods: config.cors.methods
 }));
 
-// Rate limiting
+// Rate limiting configuration
 const limiter = rateLimit(config.rateLimit);
 app.use(limiter);
 
-// Request parsing
+// Request parsing with size limit
 app.use(express.json({ limit: '1mb' }));
 
-// Add request ID and logging
+// Request ID middleware for tracking
 app.use((req, res, next) => {
     req.id = uuid.v4();
     res.setHeader('X-Request-ID', req.id);
     next();
 });
 
-// Custom morgan token for request ID
+// Configure morgan logging with custom token
 morgan.token('id', (req) => req.id);
 
-// Request logging
+// Request logging configuration with timestamp
 app.use(morgan(':id :method :url :status :response-time ms', {
     stream: {
         write: (message) => {
@@ -45,7 +50,7 @@ app.use(morgan(':id :method :url :status :response-time ms', {
     }
 }));
 
-// Record request metrics
+// Monitoring middleware for metrics
 app.use((req, res, next) => {
     res.on('finish', () => {
         monitoring.recordRequest(req.method, req.path, res.statusCode);
@@ -53,16 +58,17 @@ app.use((req, res, next) => {
     next();
 });
 
-// Initialize model
+// Initialize prediction model
 const model = new YieldPredictionModel(config.model);
 
-// Health check endpoint
-app.get('/health', (req, res) => {
+// API Routes for v1
+// Health check endpoint for monitoring
+apiV1Router.get('/health', (req, res) => {
     res.json(monitoring.getStats());
 });
 
 // API documentation endpoint
-app.get('/api-docs', (req, res) => {
+apiV1Router.get('/api-docs', (req, res) => {
     res.json({
         version: '1.0.0',
         endpoints: {
@@ -91,8 +97,8 @@ app.get('/api-docs', (req, res) => {
     });
 });
 
-// Training endpoint
-app.post('/train',
+// Model training endpoint
+apiV1Router.post('/train',
     validateRequest(['fieldId', 'cropType', 'historicalData']),
     async (req, res, next) => {
         try {
@@ -115,8 +121,8 @@ app.post('/train',
     }
 );
 
-// Cross-validation endpoint
-app.post('/cross-validate',
+// Cross-validation endpoint for model evaluation
+apiV1Router.post('/cross-validate',
     validateRequest(['fieldId', 'cropType', 'historicalData']),
     async (req, res, next) => {
         try {
@@ -134,8 +140,8 @@ app.post('/cross-validate',
     }
 );
 
-// Prediction endpoint
-app.post('/predict',
+// Yield prediction endpoint
+apiV1Router.post('/predict',
     validateRequest(['fieldId', 'cropType', 'dailyData']),
     async (req, res, next) => {
         try {
@@ -152,20 +158,52 @@ app.post('/predict',
     }
 );
 
-// Error handling middleware (should be last)
+// Mount v1 router
+app.use('/api/v1', apiV1Router);
+
+// Global error handling middleware
 app.use(errorHandler);
 
-// Start server
-app.listen(config.port, () => {
-    console.log(`[${new Date().toISOString()}] Server started on port ${config.port}`);
-    console.log(`Environment: ${config.environment}`);
-});
+// Main server initialization function
+const startServer = async () => {
+    try {
+        // Initialize Earth Engine
+        await initializeEarthEngine();
+        console.log('Earth Engine initialized successfully');
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received. Starting graceful shutdown...');
-    server.close(() => {
-        console.log('Server closed. Process terminating...');
-        process.exit(0);
-    });
-});
+        // Mount NDVI routes
+        app.use('/api/v1/ndvi', ndviRoutes);
+
+        // Additional error handling for Earth Engine routes
+        app.use((err, req, res, next) => {
+            console.error(err.stack);
+            res.status(500).json({
+                error: 'Internal Server Error',
+                message: err.message
+            });
+        });
+
+        // Start server with environment-specific port
+        const PORT = config.port || process.env.PORT || 3000;
+        const server = app.listen(PORT, () => {
+            console.log(`[${new Date().toISOString()}] Server started on port ${PORT}`);
+            console.log(`Environment: ${config.environment}`);
+        });
+
+        // Graceful shutdown handler
+        process.on('SIGTERM', () => {
+            console.log('SIGTERM received. Starting graceful shutdown...');
+            server.close(() => {
+                console.log('Server closed. Process terminating...');
+                process.exit(0);
+            });
+        });
+
+    } catch (error) {
+        console.error('Failed to initialize Earth Engine:', error);
+        process.exit(1);
+    }
+};
+
+// Start the server
+startServer();
