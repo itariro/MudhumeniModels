@@ -4,6 +4,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
 const uuid = require('uuid');
+const dotenv = require('dotenv');
 const YieldPredictionModel = require('./models/yield.predition.model');
 const { validateRequest } = require('./middleware/validation');
 const errorHandler = require('./middleware/error.handler');

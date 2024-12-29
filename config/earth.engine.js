@@ -2,7 +2,7 @@ const ee = require('@google/earthengine');
 
 const initializeEarthEngine = () => {
     return new Promise((resolve, reject) => {
-        const privateKey = process.env.GEE_PRIVATE_KEY;
+        const privateKey = process.env.GEE_PRIVATE_KEY.split(String.raw`\n`).join('\n');
         const clientEmail = process.env.GEE_CLIENT_EMAIL;
 
         ee.data.authenticateViaPrivateKey(
