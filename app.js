@@ -72,7 +72,7 @@ apiV1Router.get('/health', (req, res) => {
 apiV1Router.get('/api-docs', (req, res) => {
     res.json({
         version: '1.0.0',
-        suffix: '/api/v1',
+        prefix: '/api/v1',
         endpoints: {
             '/health': {
                 method: 'GET',
@@ -97,8 +97,28 @@ apiV1Router.get('/api-docs', (req, res) => {
             },
             '/vegetation/analyze': {
                 method: 'POST',
-                description: 'Predict yield for given daily data',
-                requiredFields: ['fieldId', 'cropType', 'dailyData']
+                description: 'Analyze vegetation indices for a given polygon and time period',
+                requiredFields: [
+                    'polygon.type',
+                    'polygon.geometry.type',
+                    'polygon.geometry.coordinates',
+                    'startDate',
+                    'endDate',
+                    'source'
+                ],
+                payload: {
+                    polygon: {
+                        type: 'Feature',
+                        properties: {},
+                        geometry: {
+                            type: 'Polygon',
+                            coordinates: '[[[number, number], ...]]'
+                        }
+                    },
+                    startDate: 'ISO date string',
+                    endDate: 'ISO date string',
+                    source: 'sentinel2a | planet | intercalibrated'
+                }
             }
         }
     });
