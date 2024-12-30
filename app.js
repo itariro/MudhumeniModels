@@ -13,6 +13,8 @@ const config = require('./config/config');
 
 const { initializeEarthEngine } = require('./config/earth.engine');
 const vegetationIndexRoutes = require('./routes/vegetation.index.routes');
+const boreholeSitesRoutes = require('./routes/borehole.sites.routes');
+
 dotenv.config();
 
 const app = express();
@@ -119,6 +121,31 @@ apiV1Router.get('/api-docs', (req, res) => {
                     endDate: 'ISO date string',
                     source: 'sentinel2a | planet | intercalibrated'
                 }
+            },
+            '/borehole/sites/analyze': {
+                method: 'POST',
+                description: 'Analyze vegetation indices for a given polygon and time period',
+                requiredFields: [
+                    'polygon.type',
+                    'polygon.geometry.type',
+                    'polygon.geometry.coordinates',
+                    'startDate',
+                    'endDate',
+                    'source'
+                ],
+                payload: {
+                    polygon: {
+                        type: 'Feature',
+                        properties: {},
+                        geometry: {
+                            type: 'Polygon',
+                            coordinates: '[[[number, number], ...]]'
+                        }
+                    },
+                    startDate: 'ISO date string',
+                    endDate: 'ISO date string',
+                    source: 'sentinel2a | planet | intercalibrated'
+                }
             }
         }
     });
@@ -200,6 +227,9 @@ const startServer = async () => {
 
         // Mount Vegetation Index Routes
         app.use('/api/v1/vegetation', vegetationIndexRoutes);
+
+        // Mount Borehole Site Routes
+        app.use('/api/v1/borehole/sites', boreholeSitesRoutes);
 
         // Additional error handling for Earth Engine routes
         app.use((err, req, res, next) => {

@@ -10,7 +10,7 @@ class VegetationIndexController {
             if (!polygon || !startDate || !endDate || !source) {
                 return res.status(400).json({
                     error: 'Missing required parameters',
-                    message: 'Polygon, start date, end date, and source are required'
+                    message: 'polygon, start date, end date, and source are required'
                 });
             }
 
