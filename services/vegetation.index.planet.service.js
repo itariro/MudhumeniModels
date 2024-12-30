@@ -17,7 +17,7 @@ class VegetationIndexServicePlanet {
             }
 
             const region = ee.Geometry.Polygon(polygon.geometry.coordinates);
-            
+
             // Check polygon area
             const area = region.area(1);
             const areaInHa = ee.Number(area).divide(10000); // Convert to hectares
@@ -29,7 +29,12 @@ class VegetationIndexServicePlanet {
             }
 
             const initialCollection = ee.ImageCollection('SKYSAT/GEN-A/PUBLIC/ORTHO/MULTISPECTRAL')
-                .filterBounds(region);
+                .filterBounds(region)
+                .filter(ee.Filter.notNull(['quality']))
+                .filter(ee.Filter.lt('cloud_cover', 20));  // Add reasonable cloud cover threshold
+
+            console.log('Collection info:', await initialCollection.getInfo());  // Add this
+
             const initialSize = await initialCollection.size().getInfo();
             console.log('Initial collection size:', initialSize);
 
@@ -62,7 +67,10 @@ class VegetationIndexServicePlanet {
             }
 
             // Select best image based on quality score
-            const image = processedCollection.first();
+            const image = processedCollection
+                .sort('quality')
+                .sort('cloud_cover')
+                .first();
             const imageProperties = await image.toDictionary().getInfo();
             console.log('Selected image properties:', {
                 date: imageProperties['system:time_start'],
@@ -117,11 +125,11 @@ class VegetationIndexServicePlanet {
             const imageWithIndices = compositeBands.addBands(Object.values(indices));
 
             // CRUCIAL CHANGE: Use sampleRegion()
-            const samples = imageWithIndices.sampleRegion({
-                collection: ee.FeatureCollection([ee.Feature(region)]), // Important: create a FeatureCollection
-                scale: 3, // 3m resolution
-                geometries: true, // Include geometry with samples
-                projection: image.projection() // Use the image's projection for accuracy
+            const samples = imageWithIndices.reduceRegion({
+                reducer: ee.Reducer.mean(),
+                geometry: region,
+                scale: 3,
+                maxPixels: 1e9
             });
 
             const sampledData = await samples.getInfo();

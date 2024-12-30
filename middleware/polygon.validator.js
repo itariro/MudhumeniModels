@@ -15,7 +15,7 @@ const polygonSchema = Joi.object({
     }).required(),
     startDate: Joi.string().isoDate().required(),
     endDate: Joi.string().isoDate().required(),
-    source: Joi.string().valid('sentinel2a', 'planet', 'intercalibrated').required()
+    source: Joi.string().valid('sentinel2a', 'planet', 'intercalibrated', 'landsat').required()
 });
 
 module.exports = { polygonSchema };
