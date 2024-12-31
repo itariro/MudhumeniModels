@@ -226,10 +226,10 @@ class BoreholeSiteService {
         return {
             monthlyAverages,
             seasonalPatterns: {
-                wetSeason: this.identifyWetSeason(monthlyAverages),
-                drySeason: this.identifyDrySeason(monthlyAverages),
-                transitionPeriods: this.identifyTransitionPeriods(monthlyAverages),
-                seasonalityIndex: this.calculateSeasonalityIndex(monthlyAverages),
+                wetSeason: this.identifyWetSeason(monthlyAverages), // TODO: implement this method
+                drySeason: this.identifyDrySeason(monthlyAverages), // TODO: implement this method
+                transitionPeriods: this.identifyTransitionPeriods(monthlyAverages), // TODO: implement this method
+                seasonalityIndex: this.calculateSeasonalityIndex(monthlyAverages), // TODO: implement this method
             },
         };
     }
@@ -364,10 +364,10 @@ class BoreholeSiteService {
         const reliabilityScore = precipAnalysis.reliabilityScores.overall;
         if (reliabilityScore > 0.8) {
             // High reliability - increase precipitation weight
-            return adjustWeights(baseWeights, 'precipitation', 0.05);
+            return this.adjustWeights(baseWeights, 'precipitation', 0.05);
         } else if (reliabilityScore < 0.4) {
             // Low reliability - decrease precipitation weight
-            return adjustWeights(baseWeights, 'precipitation', -0.05);
+            return this.adjustWeights(baseWeights, 'precipitation', -0.05);
         }
 
         return baseWeights;
@@ -436,13 +436,13 @@ class BoreholeSiteService {
             };
 
             // Analyze geological formations for depth estimation
-            const geologicalDepthFactors = analyzeGeologicalDepth(geologicalData);
+            const geologicalDepthFactors = this.analyzeGeologicalDepth(geologicalData);
 
             // Get regional water table estimates if available
-            const waterTableEstimate = await estimateWaterTable(polygon);
+            const waterTableEstimate = await this.estimateWaterTable(polygon);
 
             // Calculate depth ranges based on available data
-            const depthRanges = calculateDepthRanges(
+            const depthRanges = this.calculateDepthRanges(
                 geologicalDepthFactors,
                 waterTableEstimate,
                 precipitationAnalysis
@@ -452,7 +452,7 @@ class BoreholeSiteService {
             depthEstimate.minimumDepth = depthRanges.minimum;
             depthEstimate.maximumDepth = depthRanges.maximum;
             depthEstimate.recommendedDepth = depthRanges.recommended;
-            depthEstimate.confidenceScore = calculateDepthConfidence(depthRanges, geologicalData);
+            depthEstimate.confidenceScore = this.calculateDepthConfidence(depthRanges, geologicalData);
             depthEstimate.factors = {
                 geological: geologicalDepthFactors,
                 waterTable: waterTableEstimate,
@@ -460,7 +460,7 @@ class BoreholeSiteService {
             };
 
             // Add limitations and recommendations
-            depthEstimate.limitations = identifyDepthLimitations(depthEstimate);
+            depthEstimate.limitations = this.identifyDepthLimitations(depthEstimate);
 
             return depthEstimate;
         } catch (error) {
@@ -481,7 +481,7 @@ class BoreholeSiteService {
         // Analyze each geological formation
         geologicalData.forEach(formation => {
             // Estimate depth based on formation type
-            const depthEstimate = estimateDepthFromFormation(formation);
+            const depthEstimate = this.estimateDepthFromFormation(formation);
 
             // Track confining layers
             if (isConfiningLayer(formation)) {
@@ -505,7 +505,7 @@ class BoreholeSiteService {
             }
 
             // Record rock hardness for drilling considerations
-            depthFactors.rockHardness = calculateRockHardness(formation);
+            depthFactors.rockHardness = this.calculateRockHardness(formation);
         });
 
         return depthFactors;
@@ -645,9 +645,164 @@ class BoreholeSiteService {
         precipitationAnalysis
     );
 
+    /**
+     * Identify wet season months based on monthly averages
+     */
+    static identifyWetSeason(monthlyAverages) {
+        // Find the month with the highest average rainfall
+        const maxRainMonth = Object.keys(monthlyAverages).reduce((a, b) => monthlyAverages[a] > monthlyAverages[b] ? a : b);
 
-    // Additional helper functions (calculateAdvancedPrecipitationMetrics, analyzeGeologicalDepth, etc.)
-    // should be added here following similar principles: modular, robust, and efficient logic.
+        // Consider the surrounding months as part of the wet season
+        const wetSeason = [parseInt(maxRainMonth)];
+        let prevMonth = (parseInt(maxRainMonth) - 1 + 12) % 12; // Wrap around to December if needed
+        let nextMonth = (parseInt(maxRainMonth) + 1) % 12;
+
+        if (monthlyAverages[prevMonth] > monthlyAverages[maxRainMonth] / 2) wetSeason.push(prevMonth)
+        if (monthlyAverages[nextMonth] > monthlyAverages[maxRainMonth] / 2) wetSeason.push(nextMonth)
+        return wetSeason.sort((a, b) => a - b);
+    }
+
+    /**
+     * Identify dry season months based on monthly averages
+     */
+    static identifyDrySeason(monthlyAverages) {
+        // Find the month with the lowest average rainfall
+        const minRainMonth = Object.keys(monthlyAverages).reduce((a, b) => monthlyAverages[a] < monthlyAverages[b] ? a : b);
+
+        const drySeason = [parseInt(minRainMonth)];
+        let prevMonth = (parseInt(minRainMonth) - 1 + 12) % 12; // Wrap around to December if needed
+        let nextMonth = (parseInt(minRainMonth) + 1) % 12;
+
+        if (monthlyAverages[prevMonth] < monthlyAverages[minRainMonth] * 2) drySeason.push(prevMonth)
+        if (monthlyAverages[nextMonth] < monthlyAverages[minRainMonth] * 2) drySeason.push(nextMonth)
+        return drySeason.sort((a, b) => a - b);
+    }
+
+    /**
+     * Identify transition periods between seasons
+     */
+    static identifyTransitionPeriods(monthlyAverages) {
+        const wetSeason = this.identifyWetSeason(monthlyAverages);
+        const drySeason = this.identifyDrySeason(monthlyAverages);
+        const allMonths = Array.from({ length: 12 }, (_, i) => i);
+        const transitionPeriods = allMonths.filter(month => !wetSeason.includes(month) && !drySeason.includes(month));
+        return transitionPeriods;
+    }
+
+    /**
+     * Calculate seasonality index (simplified version)
+     */
+    static calculateSeasonalityIndex(monthlyAverages) {
+        const maxRain = Math.max(...Object.values(monthlyAverages));
+        const minRain = Math.min(...Object.values(monthlyAverages));
+        return (maxRain - minRain) / (maxRain + minRain);
+    }
+
+    /**
+     * Calculate overall reliability score
+     */
+    static calculateOverallReliability(metrics) {
+        // Combine scores from different aspects
+        const { seasonalPatterns, trends, rechargePatterns } = metrics;
+        const seasonalReliability = this.calculateSeasonalReliability(seasonalPatterns);
+        const trendReliability = this.calculateTrendReliability(trends);
+        const rechargeReliability = this.calculateRechargeReliability(rechargePatterns);
+
+        return (seasonalReliability + trendReliability + rechargeReliability) / 3;
+    }
+
+    /**
+     * Calculate seasonal reliability score (example logic)
+     */
+    static calculateSeasonalReliability(seasonalPatterns) {
+        // Example: base reliability on seasonality index
+        const seasonalityIndex = seasonalPatterns.seasonalityIndex;
+        return 1 - seasonalityIndex; // Higher seasonality = lower reliability
+    }
+
+    /**
+     * Calculate trend reliability score (example logic)
+     */
+    static calculateTrendReliability(trends) {
+        // Example: base reliability on the strength of the long-term trend
+        const trendSlope = Math.abs(trends.longTermTrend);
+        return Math.max(0, Math.min(1, 1 - trendSlope)); // Steeper slope = lower reliability
+    }
+
+    /**
+     * Calculate recharge reliability score (example logic)
+     */
+    static calculateRechargeReliability(rechargePatterns) {
+        // Example: base reliability on recharge efficiency
+        return rechargePatterns.rechargeEfficiency; // Higher efficiency = higher reliability
+    }
+
+    /**
+     * Analyze recharge patterns
+     */
+    static analyzeRechargePatterns(precipData, monthlyAverages) {
+        const rechargeThreshold = this.calculateRechargeThreshold(monthlyAverages);
+
+        return {
+            potentialRechargeEvents: this.identifyRechargeEvents(precipData, rechargeThreshold),
+            annualRechargePattern: this.calculateAnnualRechargePattern(precipData, rechargeThreshold),
+            rechargeEfficiency: this.calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold),
+        };
+    }
+
+    /**
+     * Calculate recharge threshold (example: average monthly rainfall + 1 standard deviation)
+     */
+    static calculateRechargeThreshold(monthlyAverages) {
+        const monthlyRainfall = Object.values(monthlyAverages).flat();
+        const avg = this.average(monthlyRainfall);
+        const stdDev = Math.sqrt(monthlyRainfall.reduce((sum, val) => sum + Math.pow(val - avg, 2), 0) / monthlyRainfall.length);
+        return avg + stdDev;
+    }
+
+    /**
+     * Identify recharge events
+     */
+    static identifyRechargeEvents(precipData, rechargeThreshold) {
+        const rechargeEvents = [];
+        precipData.forEach(record => {
+            if (record.rain > rechargeThreshold) {
+                rechargeEvents.push({ date: new Date(record.dt * 1000), amount: record.rain });
+            }
+        });
+        return rechargeEvents;
+    }
+
+    /**
+     * Calculate annual recharge pattern (example: total recharge per year)
+     */
+    static calculateAnnualRechargePattern(precipData, rechargeThreshold) {
+        const yearlyRecharge = {};
+        precipData.forEach(record => {
+            if (record.rain > rechargeThreshold) {
+                const year = new Date(record.dt * 1000).getFullYear();
+                yearlyRecharge[year] = (yearlyRecharge[year] || 0) + record.rain;
+            }
+        });
+        return yearlyRecharge;
+    }
+
+    /**
+     * Calculate recharge efficiency (example: total recharge / total rainfall)
+     */
+    static calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold) {
+        let totalRecharge = 0;
+        let totalRainfall = 0;
+
+        precipData.forEach(record => {
+            totalRainfall += record.rain;
+            if (record.rain > rechargeThreshold) {
+                totalRecharge += record.rain;
+            }
+        });
+
+        return totalRainfall === 0 ? 0 : totalRecharge / totalRainfall;
+    }
 
     static async getGeologicalFormations(bbox) {
         // Placeholder for actual implementation
