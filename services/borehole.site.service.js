@@ -38,7 +38,8 @@ class BoreholeSiteService {
             // Return final response
             return {
                 probability,
-                potentialMap: await this.generateMapUrl(potentialMap, area),
+                potentialMap,
+                // TODO: disabled map url -> potentialMap: await this.generateMapUrl(potentialMap, area),
                 geologicalFormations,
                 precipitationAnalysis,
                 depthEstimate,
@@ -422,8 +423,8 @@ class BoreholeSiteService {
     static estimateBoreholeDepth = async (polygon, geologicalData, precipitationAnalysis) => {
         try {
             // Get elevation data for the area
-            const elevation = ee.Image('USGS/SRTMGL1_003');
-            const region = polygon;
+            const elevation = ee.Image('USGS/SRTMGL1_003'); // TODO: replace with actual elevation data
+            const region = polygon; // TODO: region is not used, just use polygon?
 
             // Calculate basic depth metrics
             const depthEstimate = {
@@ -637,13 +638,6 @@ class BoreholeSiteService {
 
         return hardnessScale[formation.type.toLowerCase()] || 5;
     };
-
-    // Add depth estimation
-    static depthEstimate = this.estimateBoreholeDepth(
-        area,
-        geologicalFormations,
-        precipitationAnalysis
-    );
 
     /**
      * Identify wet season months based on monthly averages
