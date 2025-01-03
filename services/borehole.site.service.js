@@ -24,8 +24,11 @@ class BoreholeSiteService {
             const area = ee.Geometry.Polygon(polygon.geometry.coordinates);
 
             // Perform groundwater potential analysis
-            const { potentialMap, geologicalFormations, precipitationAnalysis } =
-                await this.calculateGroundwaterPotential(area);
+            // TODO: revisit the use of geologicalFormations
+            //const { potentialMap, geologicalFormations, precipitationAnalysis } =
+            //     await this.calculateGroundwaterPotential(area);
+            const { potentialMap, precipitationAnalysis } =
+                await this.calculateGroundwaterPotential(area);    
 
             // Estimate borehole depth
             const depthEstimate = await this.estimateBoreholeDepth(area, geologicalFormations, precipitationAnalysis);
@@ -40,7 +43,7 @@ class BoreholeSiteService {
                 probability,
                 potentialMap,
                 // TODO: disabled map url -> potentialMap: await this.generateMapUrl(potentialMap, area),
-                geologicalFormations,
+                //geologicalFormations,
                 precipitationAnalysis,
                 depthEstimate,
             };
@@ -69,12 +72,12 @@ class BoreholeSiteService {
         console.log('temperature:', { temperature });
 
         const bbox = polygon.bounds().getInfo().coordinates[0];
-        const geologicalData = await this.getGeologicalFormations(bbox);
+        // const geologicalData = await this.getGeologicalFormations(bbox);
         const weights = this.calculateDynamicWeights(precipitationAnalysis);
         const slope = ee.Terrain.slope(elevation);
 
         console.log('bbox:', { bbox });
-        console.log('geologicalData:', { geologicalData });
+        // console.log('geologicalData:', { geologicalData });
         console.log('weights:', { weights });
         console.log('slope:', { slope });
 
@@ -83,7 +86,7 @@ class BoreholeSiteService {
         const normalizedSoilMoisture = soilMoisture.select('ssm').unitScale(0, 1);
         const normalizedTemp = temperature.select('LST_Day_1km').unitScale(250, 350);
 
-        const geologyScore = ee.Image.constant(geologicalData.map((f) => f.score)).clip(polygon);
+        // const geologyScore = ee.Image.constant(geologicalData.map((f) => f.score)).clip(polygon);
         const precipScore = ee.Image.constant(precipitationAnalysis.reliabilityScores).clip(polygon);
 
         const weightedSum = ee.Image([
@@ -91,7 +94,7 @@ class BoreholeSiteService {
             normalizedSlope.multiply(weights.slope),
             normalizedSoilMoisture.multiply(weights.soilMoisture),
             normalizedTemp.multiply(weights.temperature),
-            geologyScore.multiply(weights.geology),
+            // geologyScore.multiply(weights.geology),
             precipScore.multiply(weights.precipitation),
         ]).reduce(ee.Reducer.sum());
 
@@ -902,108 +905,108 @@ class BoreholeSiteService {
         return totalRainfall === 0 ? 0 : totalRecharge / totalRainfall;
     }
 
-    static async getGeologicalFormations(bbox) {
-        try {
-            if (!bbox || bbox.length !== 4) {
-                throw new Error("Invalid bounding box format. Expected [west, south, east, north].");
-            }
+    // static async getGeologicalFormations(bbox) {
+    //     try {
+    //         if (!bbox || bbox.length !== 4) {
+    //             throw new Error("Invalid bounding box format. Expected [west, south, east, north].");
+    //         }
 
-            const [west, south, east, north] = bbox;
+    //         const [west, south, east, north] = bbox;
 
-            // Construct the WFS request URL. Adjust parameters as needed for your specific service.
-            const wfsUrl = `YOUR_WFS_ENDPOINT?service=WFS&version=1.1.0&request=GetFeature&typeName=YOUR_FEATURE_TYPE&outputFormat=application/json&bbox=${west},${south},${east},${north}&srsname=EPSG:4326`;
+    //         // Construct the WFS request URL. Adjust parameters as needed for your specific service.
+    //         const wfsUrl = `YOUR_WFS_ENDPOINT?service=WFS&version=1.1.0&request=GetFeature&typeName=YOUR_FEATURE_TYPE&outputFormat=application/json&bbox=${west},${south},${east},${north}&srsname=EPSG:4326`;
 
-            const response = await axios.get(wfsUrl);
+    //         const response = await axios.get(wfsUrl);
 
-            // Check for successful response
-            if (response.status !== 200) {
-                throw new Error(`WFS request failed with status ${response.status}`);
-            }
+    //         // Check for successful response
+    //         if (response.status !== 200) {
+    //             throw new Error(`WFS request failed with status ${response.status}`);
+    //         }
 
-            const features = response.data.features;
-            if (!features) {
-                return [];
-            }
-            // Process the features to extract relevant information (adjust based on your data structure)
-            const geologicalFormations = features.map(feature => {
-                const properties = feature.properties;
-                // Example property mapping (replace with your actual properties)
-                return {
-                    type: properties.rock_type || "Unknown", // Replace 'rock_type' with your property name
-                    description: properties.description || "No description", // Replace 'description'
-                    age: properties.age || "Unknown", // Replace 'age'
-                    structural_features: properties.structural_features || null, // Example for structural data
-                    score: this.calculateGeologicalScore(properties), // Calculate score based on properties
-                    // Add other relevant properties as needed
-                };
-            });
+    //         const features = response.data.features;
+    //         if (!features) {
+    //             return [];
+    //         }
+    //         // Process the features to extract relevant information (adjust based on your data structure)
+    //         const geologicalFormations = features.map(feature => {
+    //             const properties = feature.properties;
+    //             // Example property mapping (replace with your actual properties)
+    //             return {
+    //                 type: properties.rock_type || "Unknown", // Replace 'rock_type' with your property name
+    //                 description: properties.description || "No description", // Replace 'description'
+    //                 age: properties.age || "Unknown", // Replace 'age'
+    //                 structural_features: properties.structural_features || null, // Example for structural data
+    //                 score: this.calculateGeologicalScore(properties), // Calculate score based on properties
+    //                 // Add other relevant properties as needed
+    //             };
+    //         });
 
-            return geologicalFormations;
-        } catch (error) {
-            console.error("Error fetching geological formations:", error);
-            // Consider returning an empty array or re-throwing the error depending on your error handling strategy.
-            return [];
-        }
-    }
+    //         return geologicalFormations;
+    //     } catch (error) {
+    //         console.error("Error fetching geological formations:", error);
+    //         // Consider returning an empty array or re-throwing the error depending on your error handling strategy.
+    //         return [];
+    //     }
+    // }
 
-    static calculateGeologicalScore(properties) {
-        let score = 0;
+    // static calculateGeologicalScore(properties) {
+    //     let score = 0;
 
-        if (properties.rock_type && properties.rock_type.toLowerCase().includes("sandstone")) {
-            score += 5;
-        } else if (properties.rock_type && properties.rock_type.toLowerCase().includes("limestone")) {
-            score += 4;
-        } else if (properties.rock_type && properties.rock_type.toLowerCase().includes("granite")) {
-            score += 2; // Harder rock, less favorable
-        } else if (properties.rock_type && properties.rock_type.toLowerCase().includes("shale")) {
-            score += 3;
-        }
+    //     if (properties.rock_type && properties.rock_type.toLowerCase().includes("sandstone")) {
+    //         score += 5;
+    //     } else if (properties.rock_type && properties.rock_type.toLowerCase().includes("limestone")) {
+    //         score += 4;
+    //     } else if (properties.rock_type && properties.rock_type.toLowerCase().includes("granite")) {
+    //         score += 2; // Harder rock, less favorable
+    //     } else if (properties.rock_type && properties.rock_type.toLowerCase().includes("shale")) {
+    //         score += 3;
+    //     }
 
-        if (properties.permeability && properties.permeability > 3) {
-            score += 2;
-        }
+    //     if (properties.permeability && properties.permeability > 3) {
+    //         score += 2;
+    //     }
 
-        // Porosity scoring
-        if (properties.porosity) {
-            if (properties.porosity > 30) score += 5;
-            else if (properties.porosity > 20) score += 4;
-            else if (properties.porosity > 10) score += 3;
-            else if (properties.porosity > 5) score += 2;
-            else score += 1;
-        }
+    //     // Porosity scoring
+    //     if (properties.porosity) {
+    //         if (properties.porosity > 30) score += 5;
+    //         else if (properties.porosity > 20) score += 4;
+    //         else if (properties.porosity > 10) score += 3;
+    //         else if (properties.porosity > 5) score += 2;
+    //         else score += 1;
+    //     }
 
-        // Fracturing density scoring
-        if (properties.fracture_density) {
-            if (properties.fracture_density === "high") score += 4;
-            else if (properties.fracture_density === "medium") score += 3;
-            else if (properties.fracture_density === "low") score += 1;
-        }
+    //     // Fracturing density scoring
+    //     if (properties.fracture_density) {
+    //         if (properties.fracture_density === "high") score += 4;
+    //         else if (properties.fracture_density === "medium") score += 3;
+    //         else if (properties.fracture_density === "low") score += 1;
+    //     }
 
-        // Weathering degree scoring
-        if (properties.weathering) {
-            if (properties.weathering === "high") score += 3;
-            else if (properties.weathering === "moderate") score += 2;
-            else if (properties.weathering === "low") score += 1;
-        }
+    //     // Weathering degree scoring
+    //     if (properties.weathering) {
+    //         if (properties.weathering === "high") score += 3;
+    //         else if (properties.weathering === "moderate") score += 2;
+    //         else if (properties.weathering === "low") score += 1;
+    //     }
 
-        // Depth scoring - shallower formations might be more accessible
-        if (properties.depth) {
-            if (properties.depth < 100) score += 4;
-            else if (properties.depth < 200) score += 3;
-            else if (properties.depth < 300) score += 2;
-            else score += 1;
-        }
+    //     // Depth scoring - shallower formations might be more accessible
+    //     if (properties.depth) {
+    //         if (properties.depth < 100) score += 4;
+    //         else if (properties.depth < 200) score += 3;
+    //         else if (properties.depth < 300) score += 2;
+    //         else score += 1;
+    //     }
 
-        // Aquifer potential scoring
-        if (properties.aquifer_potential) {
-            if (properties.aquifer_potential === "high") score += 5;
-            else if (properties.aquifer_potential === "moderate") score += 3;
-            else if (properties.aquifer_potential === "low") score += 1;
-        }
+    //     // Aquifer potential scoring
+    //     if (properties.aquifer_potential) {
+    //         if (properties.aquifer_potential === "high") score += 5;
+    //         else if (properties.aquifer_potential === "moderate") score += 3;
+    //         else if (properties.aquifer_potential === "low") score += 1;
+    //     }
 
-        return score;
-    }
-    
+    //     return score;
+    // }
+
     static async generateMapUrl(potentialMap, area) {
         // Placeholder for actual implementation
         return 'map_url';
