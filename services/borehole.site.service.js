@@ -1,5 +1,13 @@
 const ee = require('@google/earthengine');
 const axios = require('axios');
+const GeoTIFF = require("geotiff");
+const turf = require('@turf/turf');
+const winston = require('winston'); // Added for structured logging
+const openmeteo = require('openmeteo');
+
+const OPENTOPOGRAPHY_KEY = process.env.OPENTOPOGRAPHY_KEY;
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
+const OPENWEATHER_URL = 'https://history.openweathermap.org/data/2.5/history/city?';
 
 const AGRO_API_KEY = process.env.AGRO_API_KEY;
 const AGRO_BASE_URL = 'https://api.agromonitoring.com/agro/1.0';
@@ -7,6 +15,16 @@ const AGRO_BASE_URL = 'https://api.agromonitoring.com/agro/1.0';
 if (!AGRO_API_KEY) {
     throw new Error('Missing AGRO_API_KEY. Please set it in your environment variables.');
 }
+
+// Configure Winston logger
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.json(),
+    transports: [
+        new winston.transports.Console(),
+        new winston.transports.File({ filename: 'borehole-site-service.log' })
+    ]
+});
 
 class BoreholeSiteService {
     static async identifyLocations(polygon) {
@@ -16,7 +34,7 @@ class BoreholeSiteService {
                 throw new Error('Invalid polygon structure. Ensure it has a "geometry" field with coordinates.');
             }
 
-            console.log('Input parameters:', {
+            logger.info('Input parameters:', {
                 polygonCoordinates: polygon.geometry.coordinates,
             });
 
@@ -24,31 +42,26 @@ class BoreholeSiteService {
             const area = ee.Geometry.Polygon(polygon.geometry.coordinates);
 
             // Perform groundwater potential analysis
-            // TODO: revisit the use of geologicalFormations
-            //const { potentialMap, geologicalFormations, precipitationAnalysis } =
-            //     await this.calculateGroundwaterPotential(area);
-            const { potentialMap, precipitationAnalysis } =
-                await this.calculateGroundwaterPotential(area);    
+            const { potentialMap, precipitationAnalysis } = await this.calculateGroundwaterPotential(area);
 
             // Estimate borehole depth
-            const depthEstimate = await this.estimateBoreholeDepth(area, geologicalFormations, precipitationAnalysis);
+            const depthEstimate = await this.estimateBoreholeDepth(area, precipitationAnalysis);
 
             // Calculate success probability
+            logger.info('Calculating success probability...');
             const probability = await this.calculateSuccessProbability(
-                { area }, geologicalFormations, precipitationAnalysis
+                { area }, [], precipitationAnalysis
             );
 
             // Return final response
             return {
                 probability,
                 potentialMap,
-                // TODO: disabled map url -> potentialMap: await this.generateMapUrl(potentialMap, area),
-                //geologicalFormations,
                 precipitationAnalysis,
                 depthEstimate,
             };
         } catch (error) {
-            console.error('Error in identifyLocations:', error);
+            logger.error('Error in identifyLocations:', error);
             throw new Error(`Borehole site identification failed: ${error.message}`);
         }
     }
@@ -57,67 +70,83 @@ class BoreholeSiteService {
         const center = polygon.centroid().coordinates().getInfo();
         const [lon, lat] = center;
 
-        console.log('Center coordinates:', { lon, lat });
+        logger.info('Center coordinates:', { lon, lat });
         const precipitationAnalysis = await this.analyzePrecipitation(lat, lon);
-        console.log('precipitationAnalysis:', { precipitationAnalysis });
+        await this.fetchHistoricalPrecipitation(lat, lon);
+        logger.info('precipitationAnalysis:', { precipitationAnalysis });
 
+        // Batch Earth Engine API calls for efficiency
         const elevation = ee.Image('USGS/SRTMGL1_003');
         const landcover = ee.ImageCollection('MODIS/006/MCD12Q1').first();
         const soilMoisture = ee.ImageCollection('NASA_USDA/HSL/SMAP_soil_moisture').first();
         const temperature = ee.ImageCollection('MODIS/006/MOD11A1').first();
 
-        console.log('elevation:', { elevation });
-        console.log('landcover:', { landcover });
-        console.log('soilMoisture:', { soilMoisture });
-        console.log('temperature:', { temperature });
+        logger.info('Earth Engine data loaded:', { elevation, landcover, soilMoisture, temperature });
 
         const bbox = polygon.bounds().getInfo().coordinates[0];
-        // const geologicalData = await this.getGeologicalFormations(bbox);
         const weights = this.calculateDynamicWeights(precipitationAnalysis);
         const slope = ee.Terrain.slope(elevation);
 
-        console.log('bbox:', { bbox });
-        // console.log('geologicalData:', { geologicalData });
-        console.log('weights:', { weights });
-        console.log('slope:', { slope });
+        logger.info('Calculating weights and slope:', { weights, slope });
 
         const normalizedElevation = elevation.unitScale(0, 3000);
         const normalizedSlope = slope.unitScale(0, 45);
         const normalizedSoilMoisture = soilMoisture.select('ssm').unitScale(0, 1);
         const normalizedTemp = temperature.select('LST_Day_1km').unitScale(250, 350);
 
-        // const geologyScore = ee.Image.constant(geologicalData.map((f) => f.score)).clip(polygon);
-        const precipScore = ee.Image.constant(precipitationAnalysis.reliabilityScores).clip(polygon);
+        const precipScore = ee.Image.constant(Math.round(precipitationAnalysis.reliabilityScores.overall)).clip(bbox);
 
         const weightedSum = ee.Image([
             normalizedElevation.multiply(weights.elevation),
             normalizedSlope.multiply(weights.slope),
             normalizedSoilMoisture.multiply(weights.soilMoisture),
             normalizedTemp.multiply(weights.temperature),
-            // geologyScore.multiply(weights.geology),
             precipScore.multiply(weights.precipitation),
         ]).reduce(ee.Reducer.sum());
 
         return {
             potentialMap: weightedSum,
-            geologicalFormations: geologicalData,
             precipitationAnalysis,
         };
     }
 
-    static async estimateBoreholeDepth(polygon, geologicalData, precipitationAnalysis) {
-        const geologicalFactors = this.analyzeGeologicalDepth(geologicalData);
-        const waterTable = await this.estimateWaterTable(polygon);
+    static createEarthEngineObjects(polygon) {
+        return {
+            elevation: ee.Image('USGS/SRTMGL1_003'),
+            landcover: ee.ImageCollection('MODIS/006/MCD12Q1').first(),
+            soilMoisture: ee.ImageCollection('NASA_USDA/HSL/SMAP_soil_moisture').first(),
+            temperature: ee.ImageCollection('MODIS/006/MOD11A1').first(),
+            slope: ee.Terrain.slope(ee.Image('USGS/SRTMGL1_003')),
+            bbox: polygon.bounds().getInfo().coordinates[0]
+        };
+    }
 
+    static async estimateBoreholeDepth(polygon, precipitationAnalysis) {
+        const elevation = ee.Image('USGS/SRTMGL1_003');
+        const slope = ee.Terrain.slope(elevation);
+        const geologicalFactors = {
+            terrainType: slope.reduceRegion({
+                reducer: ee.Reducer.mean(),
+                geometry: polygon,
+                scale: 30
+            }).getInfo(),
+            elevationProfile: elevation.reduceRegion({
+                reducer: ee.Reducer.mean(),
+                geometry: polygon,
+                scale: 30
+            }).getInfo()
+        };
+
+        const waterTable = await this.estimateWaterTable(polygon);
         const depthRanges = this.calculateDepthRanges(geologicalFactors, waterTable, precipitationAnalysis);
 
         return {
             minimumDepth: depthRanges.minimum,
             maximumDepth: depthRanges.maximum,
             recommendedDepth: depthRanges.recommended,
-            confidenceScore: this.calculateDepthConfidence(depthRanges, geologicalData),
+            confidenceScore: this.calculateDepthConfidence(depthRanges),
             factors: {
-                geological: geologicalFactors,
+                terrain: geologicalFactors,
                 waterTable,
                 precipitation: precipitationAnalysis.rechargePatterns,
             },
@@ -125,31 +154,129 @@ class BoreholeSiteService {
         };
     }
 
+    /**
+     * Analyzes precipitation data for a given latitude and longitude over the past 5 years.
+     *
+     * @param {number} lat - The latitude of the location to analyze.
+     * @param {number} lon - The longitude of the location to analyze.
+     * @returns {Promise<Object>} A promise that resolves to an object containing advanced precipitation metrics.
+     * @throws {Error} If there is an error fetching the precipitation data.
+     */
     static async analyzePrecipitation(lat, lon) {
         const end = Math.floor(Date.now() / 1000);
         const start = end - 5 * 365 * 24 * 60 * 60; // 5 years in seconds
 
         try {
-            // const response = await axios.get(`${AGRO_BASE_URL}/weather/history/accumulated_precipitation`, {
-            //     params: {
-            //         lat,
-            //         lon,
-            //         start,
-            //         end,
-            //         appid: AGRO_API_KEY,
-            //     },
-            // });
             const response = require('../data/precipitation_data_5_years.json');
             return this.calculateAdvancedPrecipitationMetrics(response);
         } catch (error) {
-            console.error('Error fetching precipitation data:', error);
+            logger.error('Error fetching precipitation data:', error);
             throw new Error('Precipitation data fetch failed.');
         }
     }
 
     /**
-   * Calculate advanced precipitation metrics
-   */
+     * Analyzes precipitation data for a given latitude and longitude, and returns advanced precipitation metrics.
+     *
+     * @param {number} lat - The latitude of the location to analyze.
+     * @param {number} lon - The longitude of the location to analyze.
+     * @returns {Promise<Object>} - An object containing advanced precipitation metrics, including annual metrics, monthly averages, seasonal patterns, extreme events, trends, recharge patterns, and reliability scores.
+     * @throws {Error} - If the precipitation data fetch fails.
+     */
+    static async analyzePrecipitationReal(lat, lon) {
+
+        const end = Math.floor(Date.now() / 1000); // UNIX timestamp in seconds
+        const start = end - 5 * 365 * 24 * 60 * 60; // 5 years ago in UNIX timestamp seconds
+
+        try {
+            const url = `${OPENWEATHER_URL}lat=${lat}&lon=${lon}&type=hour&&start=${start}&end=${end}&appid=${OPENWEATHER_API_KEY}`;
+            const response = await axios.get(url);
+
+            if (!response.data || !Array.isArray(response.data)) {
+                throw new Error('Invalid precipitation data format');
+            }
+
+            return this.calculateAdvancedPrecipitationMetrics(response.data);
+        } catch (error) {
+            logger.error('Error fetching precipitation data:', error);
+
+            // Fallback to local data for development/testing
+            try {
+                const localData = require('../data/precipitation_data_5_years.json');
+                logger.warn('Using local precipitation data as fallback');
+                return this.calculateAdvancedPrecipitationMetrics(localData);
+            } catch (localError) {
+                logger.error('Error loading local precipitation data:', localError);
+                throw new Error('Precipitation data fetch failed');
+            }
+        }
+    }
+
+    static async fetchHistoricalPrecipitation(lat, lon) {
+
+        const params = {
+            "latitude": lat,
+            "longitude": lon,
+            "start_date": new Date(Date.now() - 5 * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+            "end_date": new Date().toISOString().split('T')[0],
+            "hourly": ["temperature_2m", "rain", "cloud_cover", "soil_temperature_0_to_7cm", "soil_moisture_0_to_7cm"],
+            "timezone": "GMT"
+        };
+        
+        const url = "https://archive-api.open-meteo.com/v1/archive";
+        const responses = await openmeteo.fetchWeatherApi(url, params);
+
+        // Helper function to form time ranges
+        const range = (start, stop, step) =>
+            Array.from({ length: (stop - start) / step }, (_, i) => start + i * step);
+
+        // Process first location. Add a for-loop for multiple locations or weather models
+        const response = responses[0];
+
+        // Attributes for timezone and location
+        const utcOffsetSeconds = response.utcOffsetSeconds();
+        const timezone = response.timezone();
+        const timezoneAbbreviation = response.timezoneAbbreviation();
+        const latitude = response.latitude();
+        const longitude = response.longitude();
+
+        const hourly = response.hourly();
+
+        // Note: The order of weather variables in the URL query and the indices below need to match!
+        const weatherData = {
+
+            hourly: {
+                time: range(Number(hourly.time()), Number(hourly.timeEnd()), hourly.interval()).map(
+                    (t) => new Date((t + utcOffsetSeconds) * 1000)
+                ),
+                temperature2m: hourly.variables(0).valuesArray(),
+                rain: hourly.variables(1).valuesArray(),
+                cloudCover: hourly.variables(2).valuesArray(),
+                soilTemperature0To7cm: hourly.variables(3).valuesArray(),
+                soilMoisture0To7cm: hourly.variables(4).valuesArray(),
+            },
+
+        };
+
+        // `weatherData` now contains a simple structure with arrays for datetime and weather data
+        for (let i = 0; i < weatherData.hourly.time.length; i++) {
+            console.log(
+                weatherData.hourly.time[i].toISOString(),
+                weatherData.hourly.temperature2m[i],
+                weatherData.hourly.rain[i],
+                weatherData.hourly.cloudCover[i],
+                weatherData.hourly.soilTemperature0To7cm[i],
+                weatherData.hourly.soilMoisture0To7cm[i]
+            );
+        }
+    }
+
+    /**
+     * Calculates advanced precipitation metrics from the provided precipitation data.
+     *
+     * @param {Object[]} precipData - The precipitation data to analyze.
+     * @returns {Object} - An object containing advanced precipitation metrics, including annual metrics, monthly averages, seasonal patterns, extreme events, trends, recharge patterns, and reliability scores.
+     */
     static calculateAdvancedPrecipitationMetrics(precipData) {
         const metrics = {
             annualMetrics: [],
@@ -181,7 +308,10 @@ class BoreholeSiteService {
     }
 
     /**
-     * Group precipitation data by years and months
+     * Groups precipitation data by year and month.
+     *
+     * @param {Object[]} precipData - The precipitation data to group.
+     * @returns {Object} - An object with precipitation data grouped by year and month.
      */
     static groupPrecipitationData(precipData) {
         return precipData.reduce((acc, record) => {
@@ -198,7 +328,15 @@ class BoreholeSiteService {
     }
 
     /**
-     * Calculate annual metrics
+     * Calculates annual precipitation metrics from grouped precipitation data.
+     *
+     * @param {Object} groupedData - An object with precipitation data grouped by year and month.
+     * @returns {Object[]} - An array of annual precipitation metric objects, each containing the following properties:
+     *   - year: The year for the annual metrics.
+     *   - totalRainfall: The total rainfall for the year.
+     *   - averageMonthlyRainfall: The average monthly rainfall for the year.
+     *   - variabilityCoefficient: The coefficient of variability for the monthly rainfall.
+     *   - dryMonths: The number of months with rainfall less than 30 mm.
      */
     static calculateAnnualMetrics(groupedData) {
         return Object.entries(groupedData).map(([year, months]) => {
@@ -220,9 +358,6 @@ class BoreholeSiteService {
         });
     }
 
-    /**
-     * Analyze seasonal patterns
-     */
     static analyzeSeasonalPatterns(groupedData) {
         const monthlyAverages = {};
         const monthlyVariability = {};
@@ -240,17 +375,50 @@ class BoreholeSiteService {
         return {
             monthlyAverages,
             seasonalPatterns: {
-                wetSeason: this.identifyWetSeason(monthlyAverages), // TODO: implement this method
-                drySeason: this.identifyDrySeason(monthlyAverages), // TODO: implement this method
-                transitionPeriods: this.identifyTransitionPeriods(monthlyAverages), // TODO: implement this method
-                seasonalityIndex: this.calculateSeasonalityIndex(monthlyAverages), // TODO: implement this method
+                wetSeason: this.identifyWetSeason(monthlyAverages),
+                drySeason: this.identifyDrySeason(monthlyAverages),
+                transitionPeriods: this.identifyTransitionPeriods(monthlyAverages),
+                seasonalityIndex: this.calculateSeasonalityIndex(monthlyAverages),
             },
         };
     }
 
-    /**
-     * Identify extreme events
-     */
+    static identifyWetSeason(monthlyAverages) {
+        const maxRainMonth = Object.keys(monthlyAverages).reduce((a, b) => monthlyAverages[a] > monthlyAverages[b] ? a : b);
+        const wetSeason = [parseInt(maxRainMonth)];
+        let prevMonth = (parseInt(maxRainMonth) - 1 + 12) % 12;
+        let nextMonth = (parseInt(maxRainMonth) + 1) % 12;
+
+        if (monthlyAverages[prevMonth] > monthlyAverages[maxRainMonth] / 2) wetSeason.push(prevMonth);
+        if (monthlyAverages[nextMonth] > monthlyAverages[maxRainMonth] / 2) wetSeason.push(nextMonth);
+        return wetSeason.sort((a, b) => a - b);
+    }
+
+    static identifyDrySeason(monthlyAverages) {
+        const minRainMonth = Object.keys(monthlyAverages).reduce((a, b) => monthlyAverages[a] < monthlyAverages[b] ? a : b);
+        const drySeason = [parseInt(minRainMonth)];
+        let prevMonth = (parseInt(minRainMonth) - 1 + 12) % 12;
+        let nextMonth = (parseInt(minRainMonth) + 1) % 12;
+
+        if (monthlyAverages[prevMonth] < monthlyAverages[minRainMonth] * 2) drySeason.push(prevMonth);
+        if (monthlyAverages[nextMonth] < monthlyAverages[minRainMonth] * 2) drySeason.push(nextMonth);
+        return drySeason.sort((a, b) => a - b);
+    }
+
+    static identifyTransitionPeriods(monthlyAverages) {
+        const wetSeason = this.identifyWetSeason(monthlyAverages);
+        const drySeason = this.identifyDrySeason(monthlyAverages);
+        const allMonths = Array.from({ length: 12 }, (_, i) => i);
+        const transitionPeriods = allMonths.filter(month => !wetSeason.includes(month) && !drySeason.includes(month));
+        return transitionPeriods;
+    }
+
+    static calculateSeasonalityIndex(monthlyAverages) {
+        const maxRain = Math.max(...Object.values(monthlyAverages));
+        const minRain = Math.min(...Object.values(monthlyAverages));
+        return (maxRain - minRain) / (maxRain + minRain);
+    }
+
     static identifyExtremeEvents(precipData, monthlyAverages) {
         const events = {
             droughts: [],
@@ -289,9 +457,16 @@ class BoreholeSiteService {
         return events;
     }
 
-    /**
-     * Analyze precipitation trends
-     */
+    static calculateDroughtSeverity(rainfall, monthlyAverage) {
+        if (monthlyAverage === 0) return 1; // Maximum severity if no rain is expected
+
+        const ratio = rainfall / monthlyAverage;
+        if (ratio >= 0.5) return 0; // Not a drought
+        if (ratio >= 0.3) return 0.3; // Mild drought
+        if (ratio >= 0.1) return 0.7; // Moderate drought
+        return 1; // Severe drought
+    }
+
     static analyzePrecipitationTrends(groupedData) {
         const yearlyTotals = Object.entries(groupedData).map(([year, months]) => ({
             year: parseInt(year),
@@ -307,14 +482,9 @@ class BoreholeSiteService {
         };
     }
 
-    /**
-     * Calculate year-over-year changes in total rainfall.
-     * @param {Array<{year: number, total: number}>} yearlyTotals Array of yearly total rainfall data.
-     * @returns {Array<{year: number, change: number}>} Array of year-over-year changes.
-     */
     static calculateYearOverYearChanges(yearlyTotals) {
         if (!yearlyTotals || yearlyTotals.length < 2) {
-            return []; // Not enough data to calculate changes
+            return [];
         }
 
         const changes = [];
@@ -332,15 +502,9 @@ class BoreholeSiteService {
         return changes;
     }
 
-    /**
-     * Analyze precipitation cycles using a simplified approach (e.g., identifying peaks and troughs).
-     * This is a basic implementation and more sophisticated methods (like spectral analysis) could be used.
-     * @param {Array<{year: number, total: number}>} yearlyTotals Array of yearly total rainfall data.
-     * @returns {object} Object containing cycle information (peaks, troughs, average cycle length).
-     */
     static analyzePrecipitationCycles(yearlyTotals) {
         if (!yearlyTotals || yearlyTotals.length < 3) {
-            return { peaks: [], troughs: [], averageCycleLength: null }; // Not enough data
+            return { peaks: [], troughs: [], averageCycleLength: null };
         }
 
         const peaks = [];
@@ -376,471 +540,6 @@ class BoreholeSiteService {
         return { peaks, troughs, averageCycleLength };
     }
 
-    /**
-     * Analyze recharge patterns
-     */
-    static analyzeRechargePatterns(precipData, monthlyAverages) {
-        const rechargeThreshold = this.calculateRechargeThreshold(monthlyAverages);
-
-        return {
-            potentialRechargeEvents: this.identifyRechargeEvents(precipData, rechargeThreshold),
-            annualRechargePattern: this.calculateAnnualRechargePattern(precipData, rechargeThreshold),
-            rechargeEfficiency: this.calculateRechargeEfficiency(precipData, monthlyAverages),
-        };
-    }
-
-    /**
-     * Calculate reliability scores
-     */
-    static calculateReliabilityScores(metrics) {
-        return {
-            overall: this.calculateOverallReliability(metrics),
-            seasonal: this.calculateSeasonalReliability(metrics.seasonalPatterns),
-            trend: this.calculateTrendReliability(metrics.trends),
-            recharge: this.calculateRechargeReliability(metrics.rechargePatterns),
-        };
-    }
-
-    /**
-     * Helper function to calculate variability coefficient
-     */
-    static calculateVariabilityCoefficient(values) {
-        const avg = this.average(values);
-        const stdDev = Math.sqrt(
-            values.reduce((sum, val) => sum + Math.pow(val - avg, 2), 0) / values.length
-        );
-        return stdDev / avg;
-    }
-
-    /**
-     * Helper function to calculate average
-     */
-    static average(values) {
-        return values.reduce((sum, val) => sum + val, 0) / values.length;
-    }
-
-    /**
-     * Calculate trend slope
-     */
-    static calculateTrendSlope(data) {
-        const n = data.length;
-        const sumX = data.reduce((sum, { year }) => sum + year, 0);
-        const sumY = data.reduce((sum, { total }) => sum + total, 0);
-        const sumXY = data.reduce((sum, { year, total }) => sum + year * total, 0);
-        const sumXX = data.reduce((sum, { year }) => sum + year * year, 0);
-
-        return (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
-    }
-
-    static calculateDynamicWeights = (precipAnalysis) => {
-        const baseWeights = {
-            elevation: 0.15,
-            slope: 0.10,
-            landcover: 0.10,
-            soilMoisture: 0.15,
-            temperature: 0.10,
-            geology: 0.20,
-            precipitation: 0.20
-        };
-
-        // Adjust weights based on precipitation reliability
-        const reliabilityScore = precipAnalysis.reliabilityScores.overall;
-        if (reliabilityScore > 0.8) {
-            // High reliability - increase precipitation weight
-            return this.adjustWeights(baseWeights, 'precipitation', 0.05);
-        } else if (reliabilityScore < 0.4) {
-            // Low reliability - decrease precipitation weight
-            return this.adjustWeights(baseWeights, 'precipitation', -0.05);
-        }
-
-        return baseWeights;
-    };
-
-    // Adjust weights while maintaining sum of 1.0
-    static adjustWeights = (weights, factor, adjustment) => {
-        const newWeights = { ...weights };
-        const oldWeight = newWeights[factor];
-        const remainingFactors = Object.keys(weights).filter(k => k !== factor);
-
-        newWeights[factor] = oldWeight + adjustment;
-        const adjustmentPerFactor = adjustment / remainingFactors.length;
-
-        remainingFactors.forEach(k => {
-            newWeights[k] -= adjustmentPerFactor;
-        });
-
-        return newWeights;
-    }
-
-    // Enhanced success probability calculation
-    static calculateSuccessProbability = async (stats, geologicalFormations, precipitationAnalysis) => {
-        const weights = {
-            elevation: 0.15,
-            soilMoisture: 0.20,
-            temperature: 0.15,
-            geology: 0.25,
-            precipitation: 0.25
-        };
-
-        // Calculate scores
-        const geologyScore = geologicalFormations.reduce((sum, formation) =>
-            sum + formation.score, 0) / geologicalFormations.length;
-
-        const precipScore = precipitationAnalysis.reliabilityScore;
-
-        // Combine all factors
-        const probability = Object.entries(stats).reduce((acc, [key, value]) => {
-            if (weights[key]) {
-                return acc + (value * weights[key]);
-            }
-            return acc;
-        }, 0) +
-            (geologyScore * weights.geology) +
-            (precipScore * weights.precipitation);
-
-        return Math.min(Math.max(probability * 100, 0), 100);
-    };
-
-    // Estimate potential borehole depth
-    static estimateBoreholeDepth = async (polygon, geologicalData, precipitationAnalysis) => {
-        try {
-            // Get elevation data for the area
-            const elevation = ee.Image('USGS/SRTMGL1_003'); // TODO: replace with actual elevation data
-            const region = polygon; // TODO: region is not used, just use polygon?
-
-            // Calculate basic depth metrics
-            const depthEstimate = {
-                minimumDepth: null,
-                maximumDepth: null,
-                recommendedDepth: null,
-                confidenceScore: null,
-                factors: {},
-                limitations: []
-            };
-
-            // Analyze geological formations for depth estimation
-            const geologicalDepthFactors = this.analyzeGeologicalDepth(geologicalData);
-
-            // Get regional water table estimates if available
-            const waterTableEstimate = await this.estimateWaterTable(polygon);
-
-            // Calculate depth ranges based on available data
-            const depthRanges = this.calculateDepthRanges(
-                geologicalDepthFactors,
-                waterTableEstimate,
-                precipitationAnalysis
-            );
-
-            // Update depth estimate object
-            depthEstimate.minimumDepth = depthRanges.minimum;
-            depthEstimate.maximumDepth = depthRanges.maximum;
-            depthEstimate.recommendedDepth = depthRanges.recommended;
-            depthEstimate.confidenceScore = this.calculateDepthConfidence(depthRanges, geologicalData);
-            depthEstimate.factors = {
-                geological: geologicalDepthFactors,
-                waterTable: waterTableEstimate,
-                precipitation: precipitationAnalysis.rechargePatterns
-            };
-
-            // Add limitations and recommendations
-            depthEstimate.limitations = this.identifyDepthLimitations(depthEstimate);
-
-            return depthEstimate;
-        } catch (error) {
-            console.error('Error in depth estimation:', error);
-            throw error;
-        }
-    };
-
-    // Analyze geological formations for depth estimation
-    static analyzeGeologicalDepth = (geologicalData) => {
-        const depthFactors = {
-            estimatedAquiferDepth: null,
-            rockHardness: null,
-            fractureZones: [],
-            confiningLayers: []
-        };
-
-        // Analyze each geological formation
-        geologicalData.forEach(formation => {
-            // Estimate depth based on formation type
-            const depthEstimate = this.estimateDepthFromFormation(formation);
-
-            // Track confining layers
-            if (isConfiningLayer(formation)) {
-                depthFactors.confiningLayers.push({
-                    type: formation.type,
-                    estimatedDepth: depthEstimate
-                });
-            }
-
-            // Identify fracture zones
-            if (formation.structural_features) {
-                depthFactors.fractureZones.push({
-                    depth: depthEstimate,
-                    type: formation.structural_features
-                });
-            }
-
-            // Update aquifer depth if formation is water-bearing
-            if (isAquifer(formation)) {
-                depthFactors.estimatedAquiferDepth = depthEstimate;
-            }
-
-            // Record rock hardness for drilling considerations
-            depthFactors.rockHardness = this.calculateRockHardness(formation);
-        });
-
-        return depthFactors;
-    };
-
-    // Estimate water table depth
-    static estimateWaterTable = async (polygon) => {
-        return {
-            estimatedDepth: null,
-            confidence: 'low',
-            note: 'Local well data recommended for accurate water table depth'
-        };
-    };
-
-    // Calculate depth ranges based on available data
-    static calculateDepthRanges = (geologicalFactors, waterTable, precipAnalysis) => {
-        const ranges = {
-            minimum: 30, // Default minimum depth in meters
-            maximum: 200, // Default maximum depth in meters
-            recommended: null
-        };
-
-        // Adjust based on geological factors
-        if (geologicalFactors.estimatedAquiferDepth) {
-            ranges.recommended = geologicalFactors.estimatedAquiferDepth;
-            ranges.minimum = Math.max(ranges.minimum,
-                geologicalFactors.estimatedAquiferDepth - 20);
-            ranges.maximum = Math.min(ranges.maximum,
-                geologicalFactors.estimatedAquiferDepth + 50);
-        }
-
-        // Adjust based on confining layers
-        geologicalFactors.confiningLayers.forEach(layer => {
-            if (layer.estimatedDepth > ranges.minimum) {
-                ranges.minimum = layer.estimatedDepth + 10;
-            }
-        });
-
-        // Consider precipitation patterns
-        if (precipAnalysis.rechargePatterns.rechargeEfficiency > 0.7) {
-            ranges.minimum = Math.max(20, ranges.minimum - 10);
-        }
-
-        // Set recommended depth if not set by aquifer
-        if (!ranges.recommended) {
-            ranges.recommended = ranges.minimum +
-                (ranges.maximum - ranges.minimum) * 0.4;
-        }
-
-        return ranges;
-    };
-
-    // Calculate confidence score for depth estimation
-    static calculateDepthConfidence = (depthRanges, geologicalData) => {
-        let confidenceScore = 0.5; // Base confidence
-
-        // Adjust based on geological data quality
-        if (geologicalData.length > 0) {
-            confidenceScore += 0.2;
-        }
-
-        // Adjust based on range spread
-        const rangeSpread = depthRanges.maximum - depthRanges.minimum;
-        if (rangeSpread < 50) {
-            confidenceScore += 0.2;
-        } else if (rangeSpread > 100) {
-            confidenceScore -= 0.2;
-        }
-
-        return Math.min(Math.max(confidenceScore, 0), 1);
-    };
-
-    // Identify limitations in depth estimation
-    static identifyDepthLimitations = (depthEstimate) => {
-        const limitations = [];
-
-        // Add known limitations
-        limitations.push(
-            "Local well data would improve accuracy",
-            "Actual water table depth may vary",
-            "Local geological variations may not be captured"
-        );
-
-        // Add specific limitations based on confidence
-        if (depthEstimate.confidenceScore < 0.6) {
-            limitations.push(
-                "Limited geological data available",
-                "Recommend local hydrogeological survey"
-            );
-        }
-
-        return limitations;
-    };
-
-    // Helper functions
-    static estimateDepthFromFormation = (formation) => {
-        // Depth estimates based on formation type
-        const depthEstimates = {
-            'sandstone': { min: 30, max: 150 },
-            'limestone': { min: 40, max: 200 },
-            'granite': { min: 60, max: 250 },
-            'shale': { min: 20, max: 100 }
-        };
-
-        const estimate = depthEstimates[formation.type.toLowerCase()];
-        return estimate ?
-            (estimate.min + estimate.max) / 2 :
-            null;
-    };
-
-    static isConfiningLayer = (formation) => {
-        const confiningTypes = ['clay', 'shale', 'silt'];
-        return confiningTypes.includes(formation.type.toLowerCase());
-    };
-
-    static isAquifer = (formation) => {
-        const aquiferTypes = ['sandstone', 'limestone', 'gravel'];
-        return aquiferTypes.includes(formation.type.toLowerCase());
-    };
-
-    static calculateRockHardness = (formation) => {
-        const hardnessScale = {
-            'sandstone': 4,
-            'limestone': 5,
-            'granite': 7,
-            'shale': 3,
-            'clay': 1
-        };
-
-        return hardnessScale[formation.type.toLowerCase()] || 5;
-    };
-
-    /**
-     * Identify wet season months based on monthly averages
-     */
-    static identifyWetSeason(monthlyAverages) {
-        // Find the month with the highest average rainfall
-        const maxRainMonth = Object.keys(monthlyAverages).reduce((a, b) => monthlyAverages[a] > monthlyAverages[b] ? a : b);
-
-        // Consider the surrounding months as part of the wet season
-        const wetSeason = [parseInt(maxRainMonth)];
-        let prevMonth = (parseInt(maxRainMonth) - 1 + 12) % 12; // Wrap around to December if needed
-        let nextMonth = (parseInt(maxRainMonth) + 1) % 12;
-
-        if (monthlyAverages[prevMonth] > monthlyAverages[maxRainMonth] / 2) wetSeason.push(prevMonth)
-        if (monthlyAverages[nextMonth] > monthlyAverages[maxRainMonth] / 2) wetSeason.push(nextMonth)
-        return wetSeason.sort((a, b) => a - b);
-    }
-
-    /**
-     * Identify dry season months based on monthly averages
-     */
-    static identifyDrySeason(monthlyAverages) {
-        // Find the month with the lowest average rainfall
-        const minRainMonth = Object.keys(monthlyAverages).reduce((a, b) => monthlyAverages[a] < monthlyAverages[b] ? a : b);
-
-        const drySeason = [parseInt(minRainMonth)];
-        let prevMonth = (parseInt(minRainMonth) - 1 + 12) % 12; // Wrap around to December if needed
-        let nextMonth = (parseInt(minRainMonth) + 1) % 12;
-
-        if (monthlyAverages[prevMonth] < monthlyAverages[minRainMonth] * 2) drySeason.push(prevMonth)
-        if (monthlyAverages[nextMonth] < monthlyAverages[minRainMonth] * 2) drySeason.push(nextMonth)
-        return drySeason.sort((a, b) => a - b);
-    }
-
-    /**
-     * Identify transition periods between seasons
-     */
-    static identifyTransitionPeriods(monthlyAverages) {
-        const wetSeason = this.identifyWetSeason(monthlyAverages);
-        const drySeason = this.identifyDrySeason(monthlyAverages);
-        const allMonths = Array.from({ length: 12 }, (_, i) => i);
-        const transitionPeriods = allMonths.filter(month => !wetSeason.includes(month) && !drySeason.includes(month));
-        return transitionPeriods;
-    }
-
-    /**
-     * Calculate seasonality index (simplified version)
-     */
-    static calculateSeasonalityIndex(monthlyAverages) {
-        const maxRain = Math.max(...Object.values(monthlyAverages));
-        const minRain = Math.min(...Object.values(monthlyAverages));
-        return (maxRain - minRain) / (maxRain + minRain);
-    }
-
-    /**
-     * Calculate overall reliability score
-     */
-    static calculateOverallReliability(metrics) {
-        // Combine scores from different aspects
-        const { seasonalPatterns, trends, rechargePatterns } = metrics;
-        const seasonalReliability = this.calculateSeasonalReliability(seasonalPatterns);
-        const trendReliability = this.calculateTrendReliability(trends);
-        const rechargeReliability = this.calculateRechargeReliability(rechargePatterns);
-
-        return (seasonalReliability + trendReliability + rechargeReliability) / 3;
-    }
-
-    /**
-     * Calculate seasonal reliability score (example logic)
-     */
-    static calculateSeasonalReliability(seasonalPatterns) {
-        // Example: base reliability on seasonality index
-        const seasonalityIndex = seasonalPatterns.seasonalityIndex;
-        return 1 - seasonalityIndex; // Higher seasonality = lower reliability
-    }
-
-    /**
-     * Calculate drought severity based on rainfall deficit compared to monthly average.
-     */
-    static calculateDroughtSeverity(currentRain, monthlyAverage) {
-        if (monthlyAverage === 0) {
-            return "No Data"; // Handle cases where there's no historical average
-        }
-
-        const deficit = monthlyAverage - currentRain;
-        const percentageDeficit = (deficit / monthlyAverage) * 100;
-
-        // Define severity levels based on percentage deficit (you can adjust these thresholds)
-        if (percentageDeficit >= 75) {
-            return "Extreme Drought";
-        } else if (percentageDeficit >= 50) {
-            return "Severe Drought";
-        } else if (percentageDeficit >= 25) {
-            return "Moderate Drought";
-        } else if (percentageDeficit > 0) {
-            return "Mild Drought";
-        } else {
-            return "No Drought"; // Rainfall is at or above the monthly average
-        }
-    }
-
-    /**
-     * Calculate trend reliability score (example logic)
-     */
-    static calculateTrendReliability(trends) {
-        // Example: base reliability on the strength of the long-term trend
-        const trendSlope = Math.abs(trends.longTermTrend);
-        return Math.max(0, Math.min(1, 1 - trendSlope)); // Steeper slope = lower reliability
-    }
-
-    /**
-     * Calculate recharge reliability score (example logic)
-     */
-    static calculateRechargeReliability(rechargePatterns) {
-        // Example: base reliability on recharge efficiency
-        return rechargePatterns.rechargeEfficiency; // Higher efficiency = higher reliability
-    }
-
-    /**
-     * Analyze recharge patterns
-     */
     static analyzeRechargePatterns(precipData, monthlyAverages) {
         const rechargeThreshold = this.calculateRechargeThreshold(monthlyAverages);
 
@@ -851,9 +550,6 @@ class BoreholeSiteService {
         };
     }
 
-    /**
-     * Calculate recharge threshold (example: average monthly rainfall + 1 standard deviation)
-     */
     static calculateRechargeThreshold(monthlyAverages) {
         const monthlyRainfall = Object.values(monthlyAverages).flat();
         const avg = this.average(monthlyRainfall);
@@ -861,9 +557,6 @@ class BoreholeSiteService {
         return avg + stdDev;
     }
 
-    /**
-     * Identify recharge events
-     */
     static identifyRechargeEvents(precipData, rechargeThreshold) {
         const rechargeEvents = [];
         precipData.forEach(record => {
@@ -874,9 +567,6 @@ class BoreholeSiteService {
         return rechargeEvents;
     }
 
-    /**
-     * Calculate annual recharge pattern (example: total recharge per year)
-     */
     static calculateAnnualRechargePattern(precipData, rechargeThreshold) {
         const yearlyRecharge = {};
         precipData.forEach(record => {
@@ -888,9 +578,6 @@ class BoreholeSiteService {
         return yearlyRecharge;
     }
 
-    /**
-     * Calculate recharge efficiency (example: total recharge / total rainfall)
-     */
     static calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold) {
         let totalRecharge = 0;
         let totalRainfall = 0;
@@ -905,112 +592,553 @@ class BoreholeSiteService {
         return totalRainfall === 0 ? 0 : totalRecharge / totalRainfall;
     }
 
-    // static async getGeologicalFormations(bbox) {
-    //     try {
-    //         if (!bbox || bbox.length !== 4) {
-    //             throw new Error("Invalid bounding box format. Expected [west, south, east, north].");
-    //         }
-
-    //         const [west, south, east, north] = bbox;
-
-    //         // Construct the WFS request URL. Adjust parameters as needed for your specific service.
-    //         const wfsUrl = `YOUR_WFS_ENDPOINT?service=WFS&version=1.1.0&request=GetFeature&typeName=YOUR_FEATURE_TYPE&outputFormat=application/json&bbox=${west},${south},${east},${north}&srsname=EPSG:4326`;
-
-    //         const response = await axios.get(wfsUrl);
-
-    //         // Check for successful response
-    //         if (response.status !== 200) {
-    //             throw new Error(`WFS request failed with status ${response.status}`);
-    //         }
-
-    //         const features = response.data.features;
-    //         if (!features) {
-    //             return [];
-    //         }
-    //         // Process the features to extract relevant information (adjust based on your data structure)
-    //         const geologicalFormations = features.map(feature => {
-    //             const properties = feature.properties;
-    //             // Example property mapping (replace with your actual properties)
-    //             return {
-    //                 type: properties.rock_type || "Unknown", // Replace 'rock_type' with your property name
-    //                 description: properties.description || "No description", // Replace 'description'
-    //                 age: properties.age || "Unknown", // Replace 'age'
-    //                 structural_features: properties.structural_features || null, // Example for structural data
-    //                 score: this.calculateGeologicalScore(properties), // Calculate score based on properties
-    //                 // Add other relevant properties as needed
-    //             };
-    //         });
-
-    //         return geologicalFormations;
-    //     } catch (error) {
-    //         console.error("Error fetching geological formations:", error);
-    //         // Consider returning an empty array or re-throwing the error depending on your error handling strategy.
-    //         return [];
-    //     }
-    // }
-
-    // static calculateGeologicalScore(properties) {
-    //     let score = 0;
-
-    //     if (properties.rock_type && properties.rock_type.toLowerCase().includes("sandstone")) {
-    //         score += 5;
-    //     } else if (properties.rock_type && properties.rock_type.toLowerCase().includes("limestone")) {
-    //         score += 4;
-    //     } else if (properties.rock_type && properties.rock_type.toLowerCase().includes("granite")) {
-    //         score += 2; // Harder rock, less favorable
-    //     } else if (properties.rock_type && properties.rock_type.toLowerCase().includes("shale")) {
-    //         score += 3;
-    //     }
-
-    //     if (properties.permeability && properties.permeability > 3) {
-    //         score += 2;
-    //     }
-
-    //     // Porosity scoring
-    //     if (properties.porosity) {
-    //         if (properties.porosity > 30) score += 5;
-    //         else if (properties.porosity > 20) score += 4;
-    //         else if (properties.porosity > 10) score += 3;
-    //         else if (properties.porosity > 5) score += 2;
-    //         else score += 1;
-    //     }
-
-    //     // Fracturing density scoring
-    //     if (properties.fracture_density) {
-    //         if (properties.fracture_density === "high") score += 4;
-    //         else if (properties.fracture_density === "medium") score += 3;
-    //         else if (properties.fracture_density === "low") score += 1;
-    //     }
-
-    //     // Weathering degree scoring
-    //     if (properties.weathering) {
-    //         if (properties.weathering === "high") score += 3;
-    //         else if (properties.weathering === "moderate") score += 2;
-    //         else if (properties.weathering === "low") score += 1;
-    //     }
-
-    //     // Depth scoring - shallower formations might be more accessible
-    //     if (properties.depth) {
-    //         if (properties.depth < 100) score += 4;
-    //         else if (properties.depth < 200) score += 3;
-    //         else if (properties.depth < 300) score += 2;
-    //         else score += 1;
-    //     }
-
-    //     // Aquifer potential scoring
-    //     if (properties.aquifer_potential) {
-    //         if (properties.aquifer_potential === "high") score += 5;
-    //         else if (properties.aquifer_potential === "moderate") score += 3;
-    //         else if (properties.aquifer_potential === "low") score += 1;
-    //     }
-
-    //     return score;
-    // }
-
-    static async generateMapUrl(potentialMap, area) {
-        // Placeholder for actual implementation
-        return 'map_url';
+    static calculateReliabilityScores(metrics) {
+        return {
+            overall: this.calculateOverallReliability(metrics),
+            seasonal: this.calculateSeasonalReliability(metrics.seasonalPatterns),
+            trend: this.calculateTrendReliability(metrics.trends),
+            recharge: this.calculateRechargeReliability(metrics.rechargePatterns),
+        };
     }
+
+    static calculateOverallReliability(metrics) {
+        const { seasonalPatterns, trends, rechargePatterns } = metrics;
+        const seasonalReliability = this.calculateSeasonalReliability(seasonalPatterns);
+        const trendReliability = this.calculateTrendReliability(trends);
+        const rechargeReliability = this.calculateRechargeReliability(rechargePatterns);
+
+        return (seasonalReliability + trendReliability + rechargeReliability) / 3;
+    }
+
+    static calculateSeasonalReliability(seasonalPatterns) {
+        const seasonalityIndex = seasonalPatterns.seasonalityIndex;
+        return 1 - seasonalityIndex;
+    }
+
+    static calculateTrendReliability(trends) {
+        const trendSlope = Math.abs(trends.longTermTrend);
+        return Math.max(0, Math.min(1, 1 - trendSlope));
+    }
+
+    static calculateRechargeReliability(rechargePatterns) {
+        return rechargePatterns.rechargeEfficiency;
+    }
+
+    static calculateVariabilityCoefficient(values) {
+        const avg = this.average(values);
+        const stdDev = Math.sqrt(
+            values.reduce((sum, val) => sum + Math.pow(val - avg, 2), 0) / values.length
+        );
+        return stdDev / avg;
+    }
+
+    static average(values) {
+        return values.reduce((sum, val) => sum + val, 0) / values.length;
+    }
+
+    static calculateTrendSlope(data) {
+        const n = data.length;
+        const sumX = data.reduce((sum, { year }) => sum + year, 0);
+        const sumY = data.reduce((sum, { total }) => sum + total, 0);
+        const sumXY = data.reduce((sum, { year, total }) => sum + year * total, 0);
+        const sumXX = data.reduce((sum, { year }) => sum + year * year, 0);
+
+        return (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+    }
+
+    static calculateDynamicWeights(precipAnalysis) {
+        const baseWeights = {
+            elevation: 0.15,
+            slope: 0.10,
+            landcover: 0.10,
+            soilMoisture: 0.15,
+            temperature: 0.10,
+            geology: 0.20,
+            precipitation: 0.20
+        };
+
+        const reliabilityScore = precipAnalysis.reliabilityScores.overall;
+        if (reliabilityScore > 0.8) {
+            return this.adjustWeights(baseWeights, 'precipitation', 0.05);
+        } else if (reliabilityScore < 0.4) {
+            return this.adjustWeights(baseWeights, 'precipitation', -0.05);
+        }
+
+        return baseWeights;
+    }
+
+    static adjustWeights(weights, factor, adjustment) {
+        const newWeights = { ...weights };
+        const oldWeight = newWeights[factor];
+        const remainingFactors = Object.keys(weights).filter(k => k !== factor);
+
+        newWeights[factor] = oldWeight + adjustment;
+        const adjustmentPerFactor = adjustment / remainingFactors.length;
+
+        remainingFactors.forEach(k => {
+            newWeights[k] -= adjustmentPerFactor;
+        });
+
+        return newWeights;
+    }
+
+    /**
+     * Calculates the success probability for a given set of statistics, geological formations, and precipitation analysis.
+     *
+     * @param {Object} stats - An object containing various statistics related to the borehole site.
+     * @param {Object} [geologicalFormations=null] - An optional object containing information about the geological formations.
+     * @param {Object} precipitationAnalysis - An object containing precipitation analysis data.
+     * @returns {number} The calculated success probability, between 0 and 100.
+     */
+    static async calculateSuccessProbability(stats, geologicalFormations = null, precipitationAnalysis) {
+        let coordinates;
+        if (stats.area && stats.area.coordinates_ && Array.isArray(stats.area.coordinates_) && stats.area.coordinates_[0].length > 0) {
+            try {
+                const polygon = turf.polygon(stats.area.coordinates_);
+                const centroid = turf.centroid(polygon);
+                coordinates = centroid.geometry.coordinates;
+            } catch (error) {
+                logger.error("Error calculating centroid:", error);
+                return 50; // Return default probability if centroid calculation fails
+            }
+        } else {
+            logger.warn('Missing or invalid coordinates for probability calculation');
+            return 50; // Return default probability if coordinates are missing or invalid
+        }
+
+
+        const [lon, lat] = coordinates;
+
+        const weights = {
+            elevation: 0.15,
+            soilMoisture: 0.20,
+            temperature: 0.15,
+            geology: 0.25,
+            precipitation: 0.25
+        };
+
+        try {
+            const geologyScore = await this.calculateGeologyScore(lat, lon);
+            const precipScore = precipitationAnalysis.reliabilityScores.overall;
+
+            // Calculate weighted score (refactored for clarity)
+            let probability = 0;
+            for (const [key, value] of Object.entries(stats)) {
+                if (weights[key] && typeof value === 'number') {
+                    probability += value * weights[key];
+                }
+            }
+            probability += geologyScore * weights.geology;
+            probability += precipScore * weights.precipitation;
+
+            return Math.min(Math.max(probability * 100, 0), 100);
+
+        } catch (error) {
+            logger.error('Error calculating success probability:', error);
+            return 50; // Return default probability on error
+        }
+    }
+
+    /**
+     * Estimates the water table depth for a given polygon.
+     *
+     * @param {Object} polygon - The polygon for which to estimate the water table depth.
+     * @returns {Object} An object containing the estimated water table depth, confidence level, and a note.
+     */
+    static async estimateWaterTable(polygon) {
+        return {
+            estimatedDepth: null,
+            confidence: 'low',
+            note: 'Local well data recommended for accurate water table depth'
+        };
+    }
+
+    static calculateDepthRanges(geologicalFactors, waterTable, precipAnalysis) {
+        // Initialize with default values
+        const ranges = {
+            minimum: 30,
+            maximum: 200,
+            recommended: null
+        };
+
+        // Estimate aquifer depth based on available data
+        const estimatedAquiferDepth = this.estimateAquiferDepth(geologicalFactors, precipAnalysis);
+        if (estimatedAquiferDepth) {
+            ranges.recommended = estimatedAquiferDepth;
+            ranges.minimum = Math.max(ranges.minimum, estimatedAquiferDepth - 20);
+            ranges.maximum = Math.min(ranges.maximum, estimatedAquiferDepth + 50);
+        }
+
+        // Check for confining layers
+        const confiningLayers = this.identifyConfiningLayers(geologicalFactors);
+        confiningLayers.forEach(layer => {
+            if (layer.estimatedDepth > ranges.minimum) {
+                ranges.minimum = layer.estimatedDepth + 10;
+            }
+        });
+
+        // Adjust based on precipitation patterns
+        if (precipAnalysis.rechargePatterns.rechargeEfficiency > 0.7) {
+            ranges.minimum = Math.max(20, ranges.minimum - 10);
+        }
+
+        // Set recommended depth if not already set
+        if (!ranges.recommended) {
+            ranges.recommended = ranges.minimum + (ranges.maximum - ranges.minimum) * 0.4;
+        }
+
+        return ranges;
+    }
+
+    // Helper methods
+    static estimateAquiferDepth(geologicalFactors, precipAnalysis) {
+        // Use terrain data to estimate aquifer depth
+        const elevation = geologicalFactors.elevationProfile?.elevation || 0;
+        const terrainSlope = geologicalFactors.terrainType?.slope || 0;
+
+        // Basic estimation based on terrain and precipitation
+        let baseDepth = 50; // Default base depth
+
+        // Adjust for elevation (higher elevation = deeper aquifer)
+        baseDepth += elevation / 100;
+
+        // Adjust for slope (steeper slope = deeper aquifer)
+        baseDepth += terrainSlope * 2;
+
+        // Adjust for precipitation (higher recharge = shallower aquifer)
+        if (precipAnalysis.rechargePatterns.rechargeEfficiency > 0.6) {
+            baseDepth -= 15;
+        }
+
+        return Math.max(20, baseDepth); // Ensure minimum depth of 20m
+    }
+
+    static identifyConfiningLayers(geologicalFactors) {
+        // Default empty array if no data is available
+        if (!geologicalFactors.terrainType) {
+            return [];
+        }
+
+        // Simple logic to identify possible confining layers based on terrain
+        const possibleLayers = [];
+        const slope = geologicalFactors.terrainType.slope || 0;
+
+        // Add a confining layer at 25m for flat terrain (clay often forms here)
+        if (slope < 5) {
+            possibleLayers.push({ type: 'clay', estimatedDepth: 25 });
+        }
+
+        // Add deeper layer for hilly terrain
+        if (slope > 10) {
+            possibleLayers.push({ type: 'bedrock', estimatedDepth: 60 });
+        }
+
+        return possibleLayers;
+    }
+
+    static calculateDepthConfidence(depthRanges) {
+        let confidenceScore = 0.5; // Start with moderate confidence
+
+        // Check for reasonable range spread
+        const rangeSpread = depthRanges.maximum - depthRanges.minimum;
+        if (rangeSpread < 50) {
+            confidenceScore += 0.2; // More confident with narrower range
+        } else if (rangeSpread > 100) {
+            confidenceScore -= 0.2; // Less confident with wider range
+        }
+
+        // Check if we have a recommended depth
+        if (depthRanges.recommended) {
+            confidenceScore += 0.1;
+        }
+
+        // Bound the confidence score between 0 and 1
+        return Math.min(Math.max(confidenceScore, 0), 1);
+    }
+
+    static identifyDepthLimitations(depthEstimate) {
+        const limitations = [
+            "Local well data would improve accuracy",
+            "Actual water table depth may vary",
+            "Local geological variations may not be captured"
+        ];
+
+        if (depthEstimate.confidenceScore < 0.6) {
+            limitations.push(
+                "Limited geological data available",
+                "Recommend local hydrogeological survey"
+            );
+        }
+
+        return limitations;
+    }
+
+    /**
+     * Generates a URL for a groundwater potential map using the Earth Engine API.
+     * @param {object} potentialMap - The Earth Engine map object representing the groundwater potential.
+     * @param {object} area - The geographic area for which the map should be generated.
+     * @returns {Promise<string>} - The URL of the generated map image.
+     */
+    static async generateMapUrl(potentialMap, area) {
+        try {
+            // Get high-resolution map URL from Earth Engine
+            const mapUrl = await potentialMap.getThumbURL({
+                dimensions: '2048x1536',
+                format: 'png',
+                min: 0,
+                max: 1,
+                palette: ['0000FF', '00FFFF', '00FF00', 'FFFF00', 'FF0000'],
+                region: area.geometry,
+                scale: 10,
+                quality: 100
+            });
+
+            return mapUrl;
+        } catch (error) {
+            logger.error('Error generating map URL:', error);
+            return 'Error generating map. Please try again later.';
+        }
+    }
+
+    /**
+     * Calculate the geology score based on geological and climatic data.
+     * @param {number} lat - Latitude of the area.
+     * @param {number} lon - Longitude of the area.
+     * @returns {Promise<number>} - Geology score (0 to 1).
+     */
+    static async calculateGeologyScore(lat, lon) {
+        try {
+            // Fetch geological data from APIs
+            const geologicalFormations = await this.fetchGeologicalFormations(lat, lon);
+            const elevationData = await this.fetchElevationData(lat, lon);
+            const geologicalFeatures = await this.fetchGeologicalFeatures(lat, lon);
+            const lithologicalData = await this.fetchLithologicalData(lat, lon);
+
+            // Combine all data into a single dataset
+            const combinedData = {
+                geologicalFormations,
+                elevationData,
+                geologicalFeatures,
+                lithologicalData
+            };
+
+            // Calculate individual scores for each factor
+            const scores = {
+                aquiferPresence: this.calculateAquiferScore(combinedData.geologicalFormations),
+                rockHardness: this.calculateRockHardnessScore(combinedData.lithologicalData),
+                fractureZones: this.calculateFractureZoneScore(combinedData.geologicalFeatures),
+                elevationProfile: this.calculateElevationScore(combinedData.elevationData),
+                slope: this.calculateSlopeScore(combinedData.elevationData)
+            };
+
+            // Define weights based on real-world research
+            const weights = {
+                aquiferPresence: 0.4, // Most important factor for groundwater potential
+                rockHardness: 0.2,    // Harder rocks reduce drilling feasibility
+                fractureZones: 0.2,   // Fractures improve water flow
+                elevationProfile: 0.1, // Lower elevation is better for groundwater
+                slope: 0.1            // Steeper slopes reduce groundwater retention
+            };
+
+            // Calculate the weighted sum of scores
+            const geologyScore = Object.keys(weights).reduce((sum, factor) => {
+                return sum + (scores[factor] * weights[factor]);
+            }, 0);
+
+            // Normalize the score to ensure it is between 0 and 1
+            return Math.min(Math.max(geologyScore, 0), 1);
+        } catch (error) {
+            logger.error('Error calculating geology score:', error);
+            return 0.5; // Default score if data fetch fails
+        }
+    }
+
+    /**
+     * Fetch geological formations from USGS API.
+     */
+    static async fetchGeologicalFormations(lat, lon) {
+        const url = `https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&latitude=${lat}&longitude=${lon}&maxradiuskm=50`;
+        try {
+            const response = await axios.get(url);
+            return response.data.features.map(feature => ({
+                type: feature.properties.place, // Example: "Sandstone"
+                coordinates: feature.geometry.coordinates,
+                magnitude: feature.properties.mag // Optional: seismic activity
+            }));
+        } catch (error) {
+            logger.error('Error fetching geological data from USGS:', error);
+            throw new Error('Failed to fetch geological data.');
+        }
+    }
+
+    /**
+     * Fetch elevation data from OpenTopography API.
+     */
+    static async fetchElevationData(lat, lon) {
+        //const url = `https://portal.opentopography.org/API/globaldem?demtype=SRTMGL3&south=${lat - 0.1}&north=${lat + 0.1}&west=${lon - 0.1}&east=${lon + 0.1}&outputFormat=JSON&API_Key=${OPENTOPOGRAPHY_KEY}`;
+        const url = `https://www.gmrt.org:443/services/PointServer?longitude=${lon}&latitude=${lat}&format=json`;
+        try {
+            const response = await axios.get(url);
+            return response.data; // Contains elevation data
+        } catch (error) {
+            logger.error('Error fetching elevation data from OpenTopography:', error);
+            throw new Error('Failed to fetch elevation data.');
+        }
+    }
+
+    /**
+     * Fetch geological features from Overpass API.
+     */
+    static async fetchGeologicalFeatures(lat, lon) {
+        const query = `
+            [out:json];
+            node["geological"](around:5000,${lat},${lon});
+            out body;
+        `;
+        try {
+            const response = await axios.post('https://overpass-api.de/api/interpreter', query);
+            return response.data.elements; // Contains geological features
+        } catch (error) {
+            logger.error('Error fetching geological features from Overpass API:', error);
+            throw new Error('Failed to fetch geological features.');
+        }
+    }
+
+    /**
+     * Fetch lithological data from GLiM dataset (example integration).
+     */
+    static async fetchLithologicalData(lat, lon) {
+        // Using OneGeology WMS service for lithological data
+        const wmsUrl = `https://onegeology.brgm.fr/geoserver/wms?service=WMS&version=1.3.0&request=GetMap&layers=onegeology:glim_litho&bbox=${lon - 0.1},${lat - 0.1},${lon + 0.1},${lat + 0.1}&width=256&height=256&format=image/geotiff`;
+
+        try {
+            logger.info('Fetching lithological data for coordinates:', { lat, lon });
+            const response = await axios.get(wmsUrl, {
+                responseType: 'arraybuffer',
+                headers: {
+                    'Accept': 'image/geotiff'
+                }
+            });
+
+            // Parse GeoTIFF using geotiff.js
+            const tiff = await GeoTIFF.fromArrayBuffer(response.data);
+            const image = await tiff.getImage();
+            const rasters = await image.readRasters();
+
+            // Get lithological classification from pixel values
+            const lithologyData = [];
+            const width = image.getWidth();
+            const height = image.getHeight();
+
+            for (let i = 0; i < width * height; i++) {
+                const pixelValue = rasters[0][i];
+                // Map pixel values to lithology types based on GLiM classification
+                const lithologyType = this.mapPixelValueToLithology(pixelValue);
+                if (lithologyType) {
+                    lithologyData.push({
+                        type: lithologyType.type,
+                        coverage: lithologyType.coverage
+                    });
+                }
+            }
+
+            return lithologyData;
+        } catch (error) {
+            logger.error('Error fetching and processing lithological data:', error);
+            throw new Error('Failed to fetch and process lithological data.');
+        }
+    }
+
+    static mapPixelValueToLithology(pixelValue) {
+        // GLiM classification mapping
+        const lithologyMap = {
+            1: { type: 'granite', coverage: 1.0 },
+            2: { type: 'sandstone', coverage: 1.0 },
+            3: { type: 'limestone', coverage: 1.0 },
+            4: { type: 'shale', coverage: 1.0 },
+            5: { type: 'clay', coverage: 1.0 }
+        };
+
+        return lithologyMap[pixelValue] || null;
+    }
+
+    /**
+     * Calculate the aquifer presence score.
+     */
+    static calculateAquiferScore(geologicalFormations) {
+        const aquiferTypes = ['sandstone', 'limestone', 'gravel'];
+        const aquiferFormations = geologicalFormations.filter(formation =>
+            aquiferTypes.includes(formation.type.toLowerCase())
+        );
+
+        if (aquiferFormations.length === 0) {
+            return 0; // No aquifers present
+        }
+
+        // Score is proportional to the number of aquifer formations
+        return Math.min(aquiferFormations.length / geologicalFormations.length, 1);
+    }
+
+    /**
+     * Calculate the rock hardness score.
+     */
+    static calculateRockHardnessScore(lithologicalData) {
+        const hardnessScale = {
+            'sandstone': 4,
+            'limestone': 5,
+            'granite': 7,
+            'shale': 3,
+            'clay': 1
+        };
+
+        const totalHardness = lithologicalData.reduce((sum, formation) => {
+            const hardness = hardnessScale[formation.type.toLowerCase()] || 5; // Default hardness
+            return sum + hardness;
+        }, 0);
+
+        const averageHardness = totalHardness / lithologicalData.length;
+
+        // Normalize hardness score (lower hardness = higher score)
+        return 1 - (averageHardness / 10); // Scale hardness to 0-1 range
+    }
+
+    /**
+     * Calculate the fracture zone score.
+     */
+    static calculateFractureZoneScore(geologicalFeatures) {
+        const fractureFormations = geologicalFeatures.filter(formation =>
+            formation.tags?.geological === 'fracture'
+        );
+
+        if (fractureFormations.length === 0) {
+            return 0; // No fracture zones present
+        }
+
+        // Score is proportional to the number of fracture formations
+        return Math.min(fractureFormations.length / geologicalFeatures.length, 1);
+    }
+
+    /**
+     * Calculate the elevation score.
+     */
+    static calculateElevationScore(elevationData) {
+        const averageElevation = elevationData.reduce((sum, point) => sum + point.elevation, 0) / elevationData.length;
+
+        // Lower elevation is better for groundwater (normalized to 0-1 range)
+        return Math.max(0, 1 - (averageElevation / 1000)); // Assume 1000m is the upper limit
+    }
+
+    /**
+     * Calculate the slope score.
+     */
+    static calculateSlopeScore(elevationData) {
+        const slopes = elevationData.map(point => point.slope || 0);
+        const averageSlope = slopes.reduce((sum, slope) => sum + slope, 0) / slopes.length;
+
+        // Lower slope is better for groundwater retention (normalized to 0-1 range)
+        return Math.max(0, 1 - (averageSlope / 45)); // Assume 45 degrees is the upper limit
+    }
+
 }
 
 module.exports = BoreholeSiteService;

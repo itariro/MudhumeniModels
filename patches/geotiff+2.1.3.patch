@@ -1,0 +1,13 @@
+diff --git a/node_modules/geotiff/dist-node/source/blockedsource.js b/node_modules/geotiff/dist-node/source/blockedsource.js
+index 6a20549..124e60c 100644
+--- a/node_modules/geotiff/dist-node/source/blockedsource.js
++++ b/node_modules/geotiff/dist-node/source/blockedsource.js
+@@ -4,7 +4,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
+ };
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.BlockedSource = void 0;
+-const quick_lru_1 = __importDefault(require("quick-lru"));
++const quick_lru_1 = __importDefault(import("quick-lru"));
+ const basesource_js_1 = require("./basesource.js");
+ const utils_js_1 = require("../utils.js");
+ class Block {
