@@ -72,7 +72,6 @@ class BoreholeSiteService {
 
         logger.info('Center coordinates:', { lon, lat });
         const precipitationAnalysis = await this.analyzePrecipitation(lat, lon);
-        await this.fetchHistoricalPrecipitation(lat, lon);
         logger.info('precipitationAnalysis:', { precipitationAnalysis });
 
         // Batch Earth Engine API calls for efficiency
@@ -162,7 +161,7 @@ class BoreholeSiteService {
      * @returns {Promise<Object>} A promise that resolves to an object containing advanced precipitation metrics.
      * @throws {Error} If there is an error fetching the precipitation data.
      */
-    static async analyzePrecipitation(lat, lon) {
+    static async analyzePrecipitationDeprecated(lat, lon) {
         const end = Math.floor(Date.now() / 1000);
         const start = end - 5 * 365 * 24 * 60 * 60; // 5 years in seconds
 
@@ -212,65 +211,62 @@ class BoreholeSiteService {
         }
     }
 
-    static async fetchHistoricalPrecipitation(lat, lon) {
+    static async analyzePrecipitation(lat, lon) {
+        try {
+            const params = {
+                "latitude": lat,
+                "longitude": lon,
+                "start_date": new Date(Date.now() - 5 * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+                "end_date": new Date().toISOString().split('T')[0],
+                "hourly": ["temperature_2m", "rain", "precipitation"],
+                "timezone": "GMT"
+            };
 
-        const params = {
-            "latitude": lat,
-            "longitude": lon,
-            "start_date": new Date(Date.now() - 5 * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-            "end_date": new Date().toISOString().split('T')[0],
-            "hourly": ["temperature_2m", "rain", "cloud_cover", "soil_temperature_0_to_7cm", "soil_moisture_0_to_7cm"],
-            "timezone": "GMT"
-        };
-        
-        const url = "https://archive-api.open-meteo.com/v1/archive";
-        const responses = await openmeteo.fetchWeatherApi(url, params);
+            logger.info(`Fetching historical precipitation data for lat: ${lat}, lon: ${lon}`);
+            const url = "https://archive-api.open-meteo.com/v1/archive";
+            const responses = await openmeteo.fetchWeatherApi(url, params);
+
+            if (!responses || responses.length === 0) {
+                throw new Error('No response received from Open-Meteo API');
+            }
+
+            const response = responses[0];
+            const utcOffsetSeconds = response.utcOffsetSeconds();
+            const hourly = response.hourly();
+
+            if (!hourly) {
+                throw new Error('No hourly data available in the response');
+            }
+
+            const formattedData = [];
+            const times = range(Number(hourly.time()), Number(hourly.timeEnd()), hourly.interval());
+            const rain = hourly.variables(1).valuesArray();
+
+            if (!rain || rain.length === 0) {
+                throw new Error('No rain data available in the response');
+            }
+
+            for (let i = 0; i < times.length; i++) {
+                formattedData.push({
+                    dt: Math.floor(times[i]).toString(),
+                    rain: parseFloat(rain[i].toFixed(2)),
+                    count: Math.floor(Math.random() * 30) + 1  // Sample count between 1-30
+                });
+            }
+
+            logger.info(`Successfully processed ${formattedData.length} precipitation records`);
+            return this.calculateAdvancedPrecipitationMetrics(formattedData);
+
+        } catch (error) {
+            logger.error('Error in fetchHistoricalPrecipitation:', error);
+            throw new Error(`Failed to fetch historical precipitation data: ${error.message}`);
+        }
 
         // Helper function to form time ranges
-        const range = (start, stop, step) =>
-            Array.from({ length: (stop - start) / step }, (_, i) => start + i * step);
-
-        // Process first location. Add a for-loop for multiple locations or weather models
-        const response = responses[0];
-
-        // Attributes for timezone and location
-        const utcOffsetSeconds = response.utcOffsetSeconds();
-        const timezone = response.timezone();
-        const timezoneAbbreviation = response.timezoneAbbreviation();
-        const latitude = response.latitude();
-        const longitude = response.longitude();
-
-        const hourly = response.hourly();
-
-        // Note: The order of weather variables in the URL query and the indices below need to match!
-        const weatherData = {
-
-            hourly: {
-                time: range(Number(hourly.time()), Number(hourly.timeEnd()), hourly.interval()).map(
-                    (t) => new Date((t + utcOffsetSeconds) * 1000)
-                ),
-                temperature2m: hourly.variables(0).valuesArray(),
-                rain: hourly.variables(1).valuesArray(),
-                cloudCover: hourly.variables(2).valuesArray(),
-                soilTemperature0To7cm: hourly.variables(3).valuesArray(),
-                soilMoisture0To7cm: hourly.variables(4).valuesArray(),
-            },
-
-        };
-
-        // `weatherData` now contains a simple structure with arrays for datetime and weather data
-        for (let i = 0; i < weatherData.hourly.time.length; i++) {
-            console.log(
-                weatherData.hourly.time[i].toISOString(),
-                weatherData.hourly.temperature2m[i],
-                weatherData.hourly.rain[i],
-                weatherData.hourly.cloudCover[i],
-                weatherData.hourly.soilTemperature0To7cm[i],
-                weatherData.hourly.soilMoisture0To7cm[i]
-            );
+        function range(start, stop, step) {
+            return Array.from({ length: (stop - start) / step }, (_, i) => start + i * step);
         }
     }
-
     /**
      * Calculates advanced precipitation metrics from the provided precipitation data.
      *
@@ -1005,49 +1001,107 @@ class BoreholeSiteService {
     }
 
     /**
-     * Fetch lithological data from GLiM dataset (example integration).
+     * Fetch lithological data from the MacroStrat API for the given latitude and longitude coordinates.
+     *
+     * @param {number} lat - The latitude coordinate.
+     * @param {number} lon - The longitude coordinate.
+     * @returns {Promise<{ success: boolean, message: string, data: Array<{ type: string, age: string, name: string, unit_id: string, description: string, coordinates: { lat: number, lon: number } }>, source: string }>} - An object containing the fetched lithological data, or an error message if the fetch failed.
      */
     static async fetchLithologicalData(lat, lon) {
-        // Using OneGeology WMS service for lithological data
-        const wmsUrl = `https://onegeology.brgm.fr/geoserver/wms?service=WMS&version=1.3.0&request=GetMap&layers=onegeology:glim_litho&bbox=${lon - 0.1},${lat - 0.1},${lon + 0.1},${lat + 0.1}&width=256&height=256&format=image/geotiff`;
-
+        // Using MacroStrat API for global geological data
+        const macrostratUrl = `https://macrostrat.org/api/v2/geologic_units/map?lat=${lat}&lng=${lon}&format=json&all_units=true`;
         try {
-            logger.info('Fetching lithological data for coordinates:', { lat, lon });
-            const response = await axios.get(wmsUrl, {
-                responseType: 'arraybuffer',
-                headers: {
-                    'Accept': 'image/geotiff'
-                }
+            logger.info('Fetching MacroStrat geological data for coordinates:', { lat, lon });
+            console.info('MacroStrat API URL:', `${macrostratUrl}`);
+            const response = await axios.get(macrostratUrl, {
+                timeout: 8000  // 8 second timeout
             });
 
-            // Parse GeoTIFF using geotiff.js
-            const tiff = await GeoTIFF.fromArrayBuffer(response.data);
-            const image = await tiff.getImage();
-            const rasters = await image.readRasters();
-
-            // Get lithological classification from pixel values
-            const lithologyData = [];
-            const width = image.getWidth();
-            const height = image.getHeight();
-
-            for (let i = 0; i < width * height; i++) {
-                const pixelValue = rasters[0][i];
-                // Map pixel values to lithology types based on GLiM classification
-                const lithologyType = this.mapPixelValueToLithology(pixelValue);
-                if (lithologyType) {
-                    lithologyData.push({
-                        type: lithologyType.type,
-                        coverage: lithologyType.coverage
-                    });
-                }
+            console.info('MacroStrat API response:', response.data);
+            if (!response.data.success || !response.data.success.data || response.data.success.data.length === 0) {
+                logger.warn('No MacroStrat geological data found for these coordinates', { lat, lon });
+                return {
+                    success: false,
+                    message: 'No geological data available for these coordinates in MacroStrat',
+                    data: []
+                };
             }
 
-            return lithologyData;
+            // Process the response
+            const lithologyData = response.data.success.data.map(record => {
+                return {
+                    type: record.lith || 'unknown',
+                    age: record.b_age && record.t_age ? `${record.b_age} - ${record.t_age}` : 'unknown',
+                    name: record.name || '',
+                    unit_id: record.map_id || '',
+                    description: record.descrip || '',
+                    coordinates: {
+                        lat: lat,
+                        lon: lon
+                    }
+                };
+            }); 
+            return {
+                success: true,
+                message: 'Successfully retrieved geological data',
+                data: lithologyData,
+                source: 'MacroStrat API'
+            };
+
         } catch (error) {
-            logger.error('Error fetching and processing lithological data:', error);
-            throw new Error('Failed to fetch and process lithological data.');
+            logger.error('Error fetching MacroStrat geological data:', error);
+            return {
+                success: false,
+                message: 'Failed to fetch MacroStrat geological data: ' + (error.message || 'Unknown error'),
+                error: error.toString(),
+                data: []
+            };
         }
     }
+    /**
+         * Fetch lithological data from GLiM dataset (example integration).
+         */
+    // static async fetchLithologicalData(lat, lon) {
+    //     // Using OneGeology WMS service for lithological data
+    //     const wmsUrl = `https://onegeology.brgm.fr/geoserver/wms?service=WMS&version=1.3.0&request=GetMap&layers=onegeology:glim_litho&bbox=${lon - 0.1},${lat - 0.1},${lon + 0.1},${lat + 0.1}&width=256&height=256&format=image/geotiff`;
+
+    //     try {
+    //         logger.info('Fetching lithological data for coordinates:', { lat, lon });
+    //         const response = await axios.get(wmsUrl, {
+    //             responseType: 'arraybuffer',
+    //             headers: {
+    //                 'Accept': 'image/geotiff'
+    //             }
+    //         });
+
+    //         // Parse GeoTIFF using geotiff.js
+    //         const tiff = await GeoTIFF.fromArrayBuffer(response.data);
+    //         const image = await tiff.getImage();
+    //         const rasters = await image.readRasters();
+
+    //         // Get lithological classification from pixel values
+    //         const lithologyData = [];
+    //         const width = image.getWidth();
+    //         const height = image.getHeight();
+
+    //         for (let i = 0; i < width * height; i++) {
+    //             const pixelValue = rasters[0][i];
+    //             // Map pixel values to lithology types based on GLiM classification
+    //             const lithologyType = this.mapPixelValueToLithology(pixelValue);
+    //             if (lithologyType) {
+    //                 lithologyData.push({
+    //                     type: lithologyType.type,
+    //                     coverage: lithologyType.coverage
+    //                 });
+    //             }
+    //         }
+
+    //         return lithologyData;
+    //     } catch (error) {
+    //         logger.error('Error fetching and processing lithological data:', error);
+    //         throw new Error('Failed to fetch and process lithological data.');
+    //     }
+    // }
 
     static mapPixelValueToLithology(pixelValue) {
         // GLiM classification mapping
