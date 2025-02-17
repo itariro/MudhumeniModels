@@ -5,6 +5,8 @@ const turf = require('@turf/turf');
 const winston = require('winston'); // Added for structured logging
 const openmeteo = require('openmeteo');
 
+const AgriculturalLandAnalyzer = require('../utils/elevation-analysis');
+
 const OPENTOPOGRAPHY_KEY = process.env.OPENTOPOGRAPHY_KEY;
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
 const OPENWEATHER_URL = 'https://history.openweathermap.org/data/2.5/history/city?';
@@ -43,6 +45,10 @@ class BoreholeSiteService {
 
             // Perform groundwater potential analysis
             const { potentialMap, precipitationAnalysis } = await this.calculateGroundwaterPotential(area);
+
+            // Perform elevation analysis
+            const elevationAnalysis = await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
+            console.log('elevationAnalysis -> ', JSON.stringify(elevationAnalysis, null, 2));
 
             // Estimate borehole depth
             const depthEstimate = await this.estimateBoreholeDepth(area, precipitationAnalysis);
@@ -967,14 +973,19 @@ class BoreholeSiteService {
         }
     }
 
+
     /**
-     * Fetch elevation data from OpenTopography API.
+     * Fetch elevation data for the given latitude and longitude coordinates.
+     *
+     * @param {number} lat - The latitude coordinate.
+     * @param {number} lon - The longitude coordinate.
+     * @returns {Promise<Object>} - The elevation data for the specified coordinates.
      */
     static async fetchElevationData(lat, lon) {
-        //const url = `https://portal.opentopography.org/API/globaldem?demtype=SRTMGL3&south=${lat - 0.1}&north=${lat + 0.1}&west=${lon - 0.1}&east=${lon + 0.1}&outputFormat=JSON&API_Key=${OPENTOPOGRAPHY_KEY}`;
         const url = `https://www.gmrt.org:443/services/PointServer?longitude=${lon}&latitude=${lat}&format=json`;
         try {
             const response = await axios.get(url);
+            console.log('fetchElevationData -> ', response.data)
             return response.data; // Contains elevation data
         } catch (error) {
             logger.error('Error fetching elevation data from OpenTopography:', error);
@@ -1040,14 +1051,13 @@ class BoreholeSiteService {
                         lon: lon
                     }
                 };
-            }); 
+            });
             return {
                 success: true,
                 message: 'Successfully retrieved geological data',
                 data: lithologyData,
                 source: 'MacroStrat API'
             };
-
         } catch (error) {
             logger.error('Error fetching MacroStrat geological data:', error);
             return {
@@ -1134,26 +1144,153 @@ class BoreholeSiteService {
     }
 
     /**
-     * Calculate the rock hardness score.
-     */
-    static calculateRockHardnessScore(lithologicalData) {
+     * Calculates the rock hardness score based on the provided lithological data.
+     * The score is calculated as a weighted average of the Mohs hardness and compressive strength of the rock types,
+     * taking into account the coverage of each rock type.
+     * If the rock type is not found in the hardness scale, an attempt is made to classify it using an external API.
+     * The final score is normalized to the range of 0-1.
+     *
+     * @param {Array<{ type: string, coverage: number }>} lithologicalData - An array of lithological formations with their types and coverage.
+     * @returns {Promise<number>} - The calculated rock hardness score, normalized to the range of 0-1.
+    */
+    static async calculateRockHardnessScore(lithologicalData) {
         const hardnessScale = {
-            'sandstone': 4,
-            'limestone': 5,
-            'granite': 7,
-            'shale': 3,
-            'clay': 1
+            'sandstone': {
+                mohs: 4,
+                compressiveStrength: 50, // MPa
+                weight: 0.4
+            },
+            'limestone': {
+                mohs: 5,
+                compressiveStrength: 60, // MPa
+                weight: 0.5
+            },
+            'granite': {
+                mohs: 7,
+                compressiveStrength: 200, // MPa
+                weight: 0.7
+            },
+            'shale': {
+                mohs: 3,
+                compressiveStrength: 30, // MPa
+                weight: 0.3
+            },
+            'clay': {
+                mohs: 1,
+                compressiveStrength: 10, // MPa
+                weight: 0.1
+            },
+            'metamorphic': {
+                mohs: 6,
+                compressiveStrength: 150, // MPa
+                weight: 0.6
+            },
+            'plutonic': {
+                mohs: 7,
+                compressiveStrength: 200, // MPa
+                weight: 0.7
+            }
         };
 
-        const totalHardness = lithologicalData.reduce((sum, formation) => {
-            const hardness = hardnessScale[formation.type.toLowerCase()] || 5; // Default hardness
-            return sum + hardness;
-        }, 0);
+        console.log('lithologicalData -> ', lithologicalData);
 
-        const averageHardness = totalHardness / lithologicalData.length;
+        if (lithologicalData.success) {
+            lithologicalData.data.forEach(formation => {
+                console.log('formation -> ', formation.type);
+            });
+        }
 
-        // Normalize hardness score (lower hardness = higher score)
-        return 1 - (averageHardness / 10); // Scale hardness to 0-1 range
+
+
+        const totalScore = await lithologicalData.data.reduce(async (sumPromise, formation) => {
+            const sum = await sumPromise;
+            let rockProperties = hardnessScale[formation.type.toLowerCase()];
+
+            if (!rockProperties) {
+                // Attempt to classify unknown rock types based on description or name
+                rockProperties = await this.classifyUnknownRockType(formation);
+            }
+
+            if (!rockProperties) {
+                return sum + 0.5; // Default score for unknown rock types
+            }
+
+            // Calculate weighted score based on multiple factors
+            const mohsScore = rockProperties.mohs / 10;
+            const strengthScore = rockProperties.compressiveStrength / 200;
+            const combinedScore = (mohsScore * 0.4 + strengthScore * 0.6) * rockProperties.weight;
+
+            return sum + (combinedScore * formation.coverage);
+        }, Promise.resolve(0));
+
+        const totalCoverage = lithologicalData.data.reduce((sum, formation) => sum + formation.coverage, 0);
+        const averageScore = totalScore / totalCoverage;
+
+        // Normalize final score to 0-1 range
+        return Math.min(Math.max(1 - averageScore, 0), 1);
+    }
+
+    /**
+     * Attempts to classify an unknown rock type based on geological features near the given coordinates.
+     * @param {Object} formation - The geological formation to classify.
+     * @param {Object} formation.coordinates - The coordinates of the geological formation.
+     * @param {number} formation.coordinates.lat - The latitude of the geological formation.
+     * @param {number} formation.coordinates.lon - The longitude of the geological formation.
+     * @returns {Object|null} - The rock properties if a match is found, or null if no match is found.
+     */
+    static async classifyUnknownRockType(formation) {
+        const hardnessScale = {
+            'sandstone': { mohs: 4, compressiveStrength: 50, weight: 0.4 },
+            'limestone': { mohs: 5, compressiveStrength: 60, weight: 0.5 },
+            'granite': { mohs: 7, compressiveStrength: 200, weight: 0.7 },
+            'shale': { mohs: 3, compressiveStrength: 30, weight: 0.3 },
+            'clay': { mohs: 1, compressiveStrength: 10, weight: 0.1 },
+            'metamorphic': { mohs: 6, compressiveStrength: 150, weight: 0.6 },
+            'plutonic': { mohs: 7, compressiveStrength: 200, weight: 0.7 }
+        };
+
+        const { lat, lon } = formation.coordinates;
+
+        try {
+            // Step 1: Query OpenStreetMap Overpass API for geological features near the coordinates
+            const overpassQuery = `
+                [out:json][timeout:25];
+                (
+                    node["geology"](around:1000, ${lat}, ${lon});
+                    way["geology"](around:1000, ${lat}, ${lon});
+                    relation["geology"](around:1000, ${lat}, ${lon});
+                );
+                out body;
+                >;
+                out skel qt;
+            `;
+
+            const overpassUrl = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(overpassQuery)}`;
+            const response = await axios.get(overpassUrl);
+
+            // Step 2: Parse the response and look for relevant geological tags
+            const elements = response.data.elements;
+            if (elements.length === 0) return null;
+
+            // Step 3: Extract geology tags and match them to known rock types
+            for (const element of elements) {
+                const geologyTags = element.tags?.geology || '';
+                if (!geologyTags) continue;
+
+                // Check if the geology tags contain any known rock types
+                const knownRockTypes = Object.keys(hardnessScale);
+                for (const rockType of knownRockTypes) {
+                    if (geologyTags.toLowerCase().includes(rockType)) {
+                        return hardnessScale[rockType];
+                    }
+                }
+            }
+
+            return null; // No matching rock type found
+        } catch (error) {
+            console.error('Error classifying rock type using Overpass API:', error);
+            return null;
+        }
     }
 
     /**
@@ -1176,10 +1313,18 @@ class BoreholeSiteService {
      * Calculate the elevation score.
      */
     static calculateElevationScore(elevationData) {
-        const averageElevation = elevationData.reduce((sum, point) => sum + point.elevation, 0) / elevationData.length;
-
-        // Lower elevation is better for groundwater (normalized to 0-1 range)
-        return Math.max(0, 1 - (averageElevation / 1000)); // Assume 1000m is the upper limit
+        if (Array.isArray(elevationData)) {
+            const elevations = elevationData.map(point => parseFloat(point.elevation)).filter(e => !isNaN(e));
+            if (elevations.length === 0) return 0;
+            const averageElevation = elevations.reduce((sum, e) => sum + e, 0) / elevations.length;
+            return Math.max(0, 1 - (averageElevation / 1000)); // Assume 1000m is the upper limit
+        } else if (elevationData && elevationData.elevation) {
+            const elevation = parseFloat(elevationData.elevation);
+            if (isNaN(elevation)) return 0;
+            return Math.max(0, 1 - (elevation / 1000)); // Assume 1000m is the upper limit
+        } else {
+            return 0;
+        }
     }
 
     /**
