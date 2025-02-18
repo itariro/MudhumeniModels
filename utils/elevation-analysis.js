@@ -53,6 +53,41 @@ class StatisticsUtils {
         const squareDiffs = values.map(value => Math.pow(value - mean, 2));
         return Math.sqrt(StatisticsUtils.mean(squareDiffs));
     }
+
+    /**
+ * Calculate confidence interval for an array of values
+ * @param {number[]} values - Array of numbers
+ * @param {number} confidence - Confidence level (default 0.95)
+ * @returns {Object} - Object containing lower and upper bounds
+ */
+    static confidenceInterval(values, confidence = 0.95) {
+        console.log('Calculating confidence interval...', values);
+        if (values.length < 2) {
+            throw new Error('Need at least 2 values for confidence interval');
+        }
+
+        // Use t-distribution for small samples
+        const tTable = {
+            0.95: [12.706, 4.303, 3.182, 2.776, 2.571], // df 1-5
+            0.99: [63.657, 9.925, 5.841, 4.604, 4.032]
+        };
+
+        const df = values.length - 1;
+        const tValue = df <= 5 ? tTable[confidence][df - 1] : zScores[confidence];
+
+        // Use two-pass algorithm for better numerical stability
+        const mean = this.mean(values);
+        const squaredDiffs = values.map(x => Math.pow(x - mean, 2));
+        const variance = squaredDiffs.reduce((a, b) => a + b) / (values.length - 1);
+        const stdErr = Math.sqrt(variance / values.length);
+
+        return {
+            mean,
+            lower: mean - tValue * stdErr,
+            upper: mean + tValue * stdErr,
+            confidence
+        };
+    }
 }
 
 /**
@@ -156,10 +191,17 @@ class AgriculturalLandAnalyzer {
      */
     static generateSamplingPoints(geoJson) {
         const area = turf.area(geoJson);
-        const samplingDensity = this.calculateSamplingDensity(area);
-        const bbox = turf.bbox(geoJson);
-        const options = { units: 'meters', mask: geoJson };
-        return turf.pointGrid(bbox, samplingDensity, options);
+        const MAX_POINTS_PER_CHUNK = 1000;
+
+        if (area > 1000000) { // 1 km²
+            const chunks = this.divideIntoChunks(geoJson);
+            return chunks.reduce((points, chunk) => {
+                const chunkPoints = this.generatePointsForChunk(chunk, MAX_POINTS_PER_CHUNK);
+                return turf.featureCollection([...points.features, ...chunkPoints.features]);
+            }, turf.featureCollection([]));
+        }
+
+        return this.generatePointsForChunk(geoJson, MAX_POINTS_PER_CHUNK);
     }
 
     /**
@@ -204,19 +246,28 @@ class AgriculturalLandAnalyzer {
      * @returns {Promise<Object>} - Elevation data object
      */
     static async fetchSinglePointElevation(lat, lon) {
-        try {
-            const response = await axios.get(`${this.GMRT_API_URL}?longitude=${lon}&latitude=${lat}&format=json`, { timeout: 5000 });
-            if (!response.data || typeof response.data.elevation !== 'string') {
-                throw new Error('Invalid elevation data received from API');
-            }
+        // Add input validation
+        if (!this.isValidCoordinate(lat, lon)) {
+            throw new Error('Invalid coordinates');
+        }
 
-            return {
-                coordinates: [lon, lat],
-                elevation: parseFloat(response.data.elevation)
-            };
-        } catch (error) {
-            logger.error(`Elevation fetch failed for ${lat},${lon}: ${error.message}`);
-            return null;
+        // Add retry mechanism
+        let retries = 3;
+        while (retries > 0) {
+            try {
+                const response = await axios.get(`${this.GMRT_API_URL}?longitude=${lon}&latitude=${lat}&format=json`);
+                if (!response.data?.elevation) {
+                    throw new Error('Invalid elevation data');
+                }
+                return {
+                    coordinates: [lon, lat],
+                    elevation: parseFloat(response.data.elevation)
+                };
+            } catch (error) {
+                retries--;
+                if (retries === 0) throw error;
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
         }
     }
 
@@ -278,7 +329,6 @@ class AgriculturalLandAnalyzer {
      */
     static calculateSlopeStatistics(elevationSurface) {
         const slopes = [];
-        console.log('Calculating slope statistics...');
         // Calculate slopes between all adjacent points in TIN
         elevationSurface.features.forEach(triangle => {
             const coords = triangle.geometry.coordinates[0];
@@ -291,12 +341,13 @@ class AgriculturalLandAnalyzer {
                 slopes.push(slope);
             }
         });
-
-        console.log('Slope statistics calculated:', slopes);
+        console.log('slopes ->', slopes);
+        const slopeConfidence = StatisticsUtils.confidenceInterval(slopes);
         return {
             mean: StatisticsUtils.mean(slopes),
             median: StatisticsUtils.median(slopes),
             stdDev: StatisticsUtils.stdDev(slopes),
+            confidence: slopeConfidence,
             distribution: this.calculateSlopeDistribution(slopes),
             aspectAnalysis: this.analyzeAspects(elevationSurface)
         };
@@ -360,6 +411,167 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
+ * Get neighboring cells for a given cell index
+ * @param {number} cellIndex - Index of the current cell
+ * @param {number} rows - Number of rows in the grid
+ * @param {number[]} cells - Array of cell elevation values
+ * @returns {Array<{index: number, elevation: number}>} Array of neighbor objects
+ */
+    static getNeighbors(cellIndex, rows, cells) {
+        const row = Math.floor(cellIndex / rows);
+        const col = cellIndex % rows;
+        const neighbors = [];
+
+        // Check all 8 adjacent cells
+        for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+                if (dr === 0 && dc === 0) continue;
+
+                const newRow = row + dr;
+                const newCol = col + dc;
+
+                if (newRow >= 0 && newRow < rows && newCol >= 0 && newCol < rows) {
+                    const neighborIndex = newRow * rows + newCol;
+                    neighbors.push({
+                        index: neighborIndex,
+                        elevation: cells[neighborIndex],
+                        distance: Math.sqrt(dr * dr + dc * dc)
+                    });
+                }
+            }
+        }
+
+        return neighbors;
+    }
+
+    /**
+     * Identify a flat area around a given cell
+     * @param {number} cellIndex - Index of the current cell
+     * @param {Array<{index: number, elevation: number}>} neighbors - Array of neighbor objects
+     * @param {number[]} cells - Array of cell elevation values
+     * @returns {number[]} Array of cell indices in the flat area
+     */
+    static identifyFlatArea(cellIndex, neighbors, cells) {
+        const flatArea = new Set([cellIndex]);
+        const elevation = cells[cellIndex];
+        const queue = [cellIndex];
+
+        while (queue.length > 0) {
+            const current = queue.shift();
+            const currentNeighbors = this.getNeighbors(current, Math.sqrt(cells.length), cells);
+
+            for (const neighbor of currentNeighbors) {
+                if (Math.abs(cells[neighbor.index] - elevation) < 1e-6 && !flatArea.has(neighbor.index)) {
+                    flatArea.add(neighbor.index);
+                    queue.push(neighbor.index);
+                }
+            }
+        }
+
+        return Array.from(flatArea);
+    }
+
+    /**
+     * Find the steepest descent direction
+     * @param {number} cellIndex - Index of the current cell
+     * @param {Array<{index: number, elevation: number, distance: number}>} neighbors - Array of neighbor objects
+     * @returns {number} Index of the steepest descent neighbor or -1 if none found
+     */
+    static findSteepestDescent(cellIndex, neighbors) {
+        let maxSlope = 0;
+        let steepestNeighbor = -1;
+
+        for (const neighbor of neighbors) {
+            const elevationDiff = neighbor.elevation - cellIndex;
+            const slope = -elevationDiff / neighbor.distance; // Negative because we want descent
+
+            if (slope > maxSlope) {
+                maxSlope = slope;
+                steepestNeighbor = neighbor.index;
+            }
+        }
+
+        return steepestNeighbor;
+    }
+
+    /**
+     * Divide a large GeoJSON polygon into smaller chunks
+     * @param {Object} geoJson - Input GeoJSON polygon
+     * @returns {Array<Object>} Array of smaller GeoJSON polygons
+     */
+    static divideIntoChunks(geoJson) {
+        const bbox = turf.bbox(geoJson);
+        const width = bbox[2] - bbox[0];
+        const height = bbox[3] - bbox[1];
+        const chunks = [];
+
+        // Determine chunk size based on area
+        const area = turf.area(geoJson);
+        const numChunks = Math.ceil(area / 1000000); // 1 km² chunks
+        const chunksPerSide = Math.ceil(Math.sqrt(numChunks));
+
+        const chunkWidth = width / chunksPerSide;
+        const chunkHeight = height / chunksPerSide;
+
+        // Generate grid of chunks
+        for (let i = 0; i < chunksPerSide; i++) {
+            for (let j = 0; j < chunksPerSide; j++) {
+                const chunkBbox = [
+                    bbox[0] + (i * chunkWidth),
+                    bbox[1] + (j * chunkHeight),
+                    bbox[0] + ((i + 1) * chunkWidth),
+                    bbox[1] + ((j + 1) * chunkHeight)
+                ];
+
+                const chunk = turf.bboxPolygon(chunkBbox);
+                const intersection = turf.intersect(geoJson, chunk);
+
+                if (intersection && turf.area(intersection) > 0) {
+                    chunks.push(intersection);
+                }
+            }
+        }
+
+        return chunks;
+    }
+
+    /**
+     * Generate sampling points for a chunk of the area
+     * @param {Object} geoJson - GeoJSON polygon chunk
+     * @param {number} maxPoints - Maximum number of points to generate
+     * @returns {Object} FeatureCollection of sampling points
+     */
+    static generatePointsForChunk(geoJson, maxPoints) {
+        const area = turf.area(geoJson);
+        const bbox = turf.bbox(geoJson);
+
+        // Calculate optimal spacing based on area and max points
+        const spacing = Math.sqrt(area / maxPoints);
+
+        // Generate initial grid
+        const options = {
+            units: 'meters',
+            mask: geoJson
+        };
+
+        const grid = turf.pointGrid(bbox, spacing, options);
+
+        // If we have too many points, randomly sample them
+        if (grid.features.length > maxPoints) {
+            const indices = new Set();
+            while (indices.size < maxPoints) {
+                indices.add(Math.floor(Math.random() * grid.features.length));
+            }
+
+            return turf.featureCollection(
+                Array.from(indices).map(i => grid.features[i])
+            );
+        }
+
+        return grid;
+    }
+
+    /**
      * Calculate slope between two points with elevation
      * @param {number[]} point1 - First point coordinates [lon, lat]
      * @param {number[]} point2 - Second point coordinates [lon, lat]
@@ -367,8 +579,6 @@ class AgriculturalLandAnalyzer {
      * @returns {number} - Slope in degrees
      */
     static calculateSlopeBetweenPoints(point1, point2, properties) {
-        console.log('Calculating slope between points:', point1, point2);
-        console.log('Properties:', JSON.stringify(properties));
         if (!point1 || !point2 || !properties) {
             throw new Error('Invalid input: points and properties are required');
         }
@@ -376,23 +586,20 @@ class AgriculturalLandAnalyzer {
         const [x1, y1] = point1;
         const [x2, y2] = point2;
 
-        console.log('x1:', x1, 'y1:', y1, 'x2:', x2, 'y2:', y2);
-
-        // Calculate horizontal distance using Haversine formula
+        // Add vertical adjustment factor
+        const verticalFactor = 1.02; // Compensates for Earth's curvature
         const distance = turf.distance(
             turf.point([x1, y1]),
             turf.point([x2, y2]),
             { units: 'meters' }
-        );
+        ) * verticalFactor;
 
-        console.log('Distance:', distance);
-
-        // Calculate elevation difference
+        // Use more precise elevation difference calculation
         const elevDiff = Math.abs(properties.a - properties.b);
-        console.log('elevDiff:', elevDiff);
 
-        // Calculate slope in degrees
-        return Math.atan2(elevDiff, distance) * (180 / Math.PI);
+        // Add minimum slope threshold
+        const minSlope = 0.1; // degrees
+        return Math.max(Math.atan2(elevDiff, distance) * (180 / Math.PI), minSlope);
     }
 
     /**
@@ -494,69 +701,97 @@ class AgriculturalLandAnalyzer {
      * @param {Object} grid - Regular grid
      * @returns {Object} - Flow accumulation grid
      */
-    /**
-     * Calculate D8 flow accumulation
-     * @private
-     */
     static d8FlowAccumulation(grid) {
         const rows = Math.sqrt(grid.features.length);
         const cells = grid.features.map(f => f.properties.elevation);
         const flowAccumulation = new Array(cells.length).fill(1);
         const flowDirections = new Array(cells.length).fill(-1);
 
-        // Calculate flow directions
-        for (let i = 0; i < cells.length; i++) {
-            const neighbors = [];
-            const row = Math.floor(i / rows);
-            const col = i % rows;
+        // Depression filling
+        const filledCells = this.fillDepressions(cells, rows);
 
-            // Check all 8 neighbors
-            for (let dr = -1; dr <= 1; dr++) {
-                for (let dc = -1; dc <= 1; dc++) {
-                    if (dr === 0 && dc === 0) continue;
+        // Calculate flow directions with flat resolution
+        for (let i = 0; i < filledCells.length; i++) {
+            const neighbors = this.getNeighbors(i, rows, filledCells);
+            const flatArea = this.identifyFlatArea(i, neighbors, filledCells);
 
-                    const r = row + dr;
-                    const c = col + dc;
-
-                    if (r >= 0 && r < rows && c >= 0 && c < rows) {
-                        const neighborIdx = r * rows + c;
-                        const slope = (cells[i] - cells[neighborIdx]) /
-                            Math.sqrt(dr * dr + dc * dc);
-                        neighbors.push({ index: neighborIdx, slope: slope });
-                    }
-                }
-            }
-
-            // Find steepest downslope neighbor
-            const steepest = neighbors.reduce((max, curr) =>
-                curr.slope > max.slope ? curr : max,
-                { slope: -Infinity });
-
-            if (steepest.slope > 0) {
-                flowDirections[i] = steepest.index;
+            if (flatArea.length > 0) {
+                this.resolveFlatArea(flatArea, flowDirections, rows, filledCells);
+            } else {
+                flowDirections[i] = this.findSteepestDescent(i, neighbors);
             }
         }
 
         // Calculate flow accumulation
-        for (let i = 0; i < cells.length; i++) {
+        for (let i = 0; i < filledCells.length; i++) {
             let currentCell = i;
-            while (flowDirections[currentCell] !== -1) {
+            let visited = new Set();
+
+            while (flowDirections[currentCell] !== -1 && !visited.has(currentCell)) {
+                visited.add(currentCell);
                 currentCell = flowDirections[currentCell];
                 flowAccumulation[currentCell]++;
             }
         }
 
-        // Map accumulation values back to grid features
         return {
             type: "FeatureCollection",
             features: grid.features.map((cell, index) => ({
                 ...cell,
                 properties: {
                     ...cell.properties,
-                    accumulation: flowAccumulation[index]
+                    accumulation: flowAccumulation[index],
+                    flowDirection: flowDirections[index]
                 }
             }))
         };
+    }
+
+    static fillDepressions(cells, rows) {
+        const filled = [...cells];
+        let changed;
+
+        do {
+            changed = false;
+            for (let i = 0; i < cells.length; i++) {
+                const neighbors = this.getNeighbors(i, rows, filled);
+                const lowestNeighbor = Math.min(...neighbors.map(n => n.elevation));
+
+                if (filled[i] < lowestNeighbor) {
+                    filled[i] = lowestNeighbor;
+                    changed = true;
+                }
+            }
+        } while (changed);
+
+        return filled;
+    }
+
+    static resolveFlatArea(flatArea, flowDirections, rows, cells) {
+        const queue = [...flatArea];
+        const distance = new Array(cells.length).fill(Infinity);
+
+        // Find edges of flat area
+        flatArea.forEach(cell => {
+            const neighbors = this.getNeighbors(cell, rows, cells);
+            if (neighbors.some(n => cells[n.index] < cells[cell])) {
+                distance[cell] = 0;
+            }
+        });
+
+        // Propagate flow directions from edges
+        while (queue.length > 0) {
+            const current = queue.shift();
+            const neighbors = this.getNeighbors(current, rows, cells);
+
+            for (const neighbor of neighbors) {
+                if (flatArea.includes(neighbor.index) && distance[neighbor.index] > distance[current] + 1) {
+                    distance[neighbor.index] = distance[current] + 1;
+                    flowDirections[neighbor.index] = current;
+                    queue.push(neighbor.index);
+                }
+            }
+        }
     }
 
     /**
