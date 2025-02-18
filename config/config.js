@@ -20,7 +20,8 @@ const config = {
     cors: {
         origins: process.env.CORS_ORIGINS?.split(',') || ['http://localhost:3000'],
         methods: ['GET', 'POST']
-    }
+    },
+    gmrtApiUrl: process.env.GMRT_API_URL || 'https://www.gmrt.org:443/services/PointServer',
 };
 
 module.exports = config;

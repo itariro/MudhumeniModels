@@ -1,25 +1,70 @@
 const axios = require('axios');
 const turf = require('@turf/turf');
 const booleanValid = require('@turf/boolean-valid');
-const winston = require('winston'); // Added for structured logging
+const winston = require('winston');
+const { valid } = require('geojson-validation');
+const config = require('../config/config');
 
+// Configure logger
+// Configure Winston logger
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.json(),
     transports: [
-        new winston.transports.Console(),
+        //new winston.transports.Console(),
         new winston.transports.File({ filename: 'elevation-analysis.log' })
     ]
 });
+
+/**
+ * Utility class for statistical calculations
+ */
+class StatisticsUtils {
+    /**
+     * Calculate the mean of an array of numbers
+     * @param {number[]} values - Array of numbers
+     * @returns {number} - Mean value
+     */
+    static mean(values) {
+        if (!values.length) throw new Error('Input array cannot be empty');
+        return values.reduce((sum, val) => sum + val, 0) / values.length;
+    }
+
+    /**
+     * Calculate the median of an array of numbers
+     * @param {number[]} values - Array of numbers
+     * @returns {number} - Median value
+     */
+    static median(values) {
+        if (!values.length) throw new Error('Input array cannot be empty');
+        const sorted = [...values].sort((a, b) => a - b);
+        const middle = Math.floor(sorted.length / 2);
+        return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
+    }
+
+    /**
+     * Calculate the standard deviation of an array of numbers
+     * @param {number[]} values - Array of numbers
+     * @returns {number} - Standard deviation
+     */
+    static stdDev(values) {
+        if (!values.length) throw new Error('Input array cannot be empty');
+        const mean = StatisticsUtils.mean(values);
+        const squareDiffs = values.map(value => Math.pow(value - mean, 2));
+        return Math.sqrt(StatisticsUtils.mean(squareDiffs));
+    }
+}
 
 /**
  * Agricultural Land Analysis System
  * Analyzes terrain characteristics for agricultural viability
  */
 class AgriculturalLandAnalyzer {
-    // Constants for analysis
-    static GMRT_API_URL = 'https://www.gmrt.org:443/services/PointServer';
+    // Configuration constants
+    static GMRT_API_URL = config.gmrtApiUrl || 'https://www.gmrt.org:443/services/PointServer';
     static EARTH_RADIUS = 6371000; // meters
+    static MAX_BATCH_SIZE = 20; // Maximum points per API batch
+    static REQUEST_DELAY_MS = 500; // Delay between API batches
 
     // Agricultural slope classifications (in degrees, based on FAO guidelines)
     static SLOPE_CLASSES = {
@@ -49,19 +94,18 @@ class AgriculturalLandAnalyzer {
     /**
      * Analyze an area defined by a GeoJSON polygon
      * @param {Object} geoJson - GeoJSON polygon defining the area
-     * @returns {Promise<Object>} Comprehensive analysis results
+     * @returns {Promise<Object>} - Comprehensive analysis results
      */
     static async analyzeArea(geoJson) {
         try {
-            // Validate GeoJSON input
-            console.log('geoJson -> ', JSON.stringify(geoJson, null, 2));
-            console.log(typeof geoJson);
+            logger.info('Starting analysis for GeoJSON area');
 
+            // Validate GeoJSON input
             if (!this.validateGeoJSON(geoJson)) {
                 throw new Error('Invalid GeoJSON polygon input');
             }
 
-            // Generate analysis points within the polygon
+            // Generate sampling points within the polygon
             const samplingPoints = this.generateSamplingPoints(geoJson);
 
             // Fetch elevation data for all points
@@ -69,7 +113,9 @@ class AgriculturalLandAnalyzer {
 
             // Perform comprehensive analysis
             const analysis = await this.performAnalysis(geoJson, elevationData);
+            console.log('Analysis:', analysis);
 
+            logger.info('Analysis completed successfully');
             return analysis;
         } catch (error) {
             logger.error('Error in area analysis:', error);
@@ -79,63 +125,66 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Validate GeoJSON input
-     * @private
+     * @param {Object} geoJson - GeoJSON object to validate
+     * @returns {boolean} - True if valid, false otherwise
      */
     static validateGeoJSON(geoJson) {
         try {
-            if (!geoJson.type || !geoJson.coordinates) {
+            if (!geoJson || !geoJson.type || !geoJson.coordinates) {
+                logger.warn('Invalid GeoJSON: Missing type or coordinates');
                 return false;
             }
             if (geoJson.type !== 'Polygon' && geoJson.type !== 'MultiPolygon') {
+                logger.warn(`Invalid GeoJSON type: ${geoJson.type}`);
+                return false;
+            }
+            if (!valid(geoJson)) {
+                logger.warn('Invalid GeoJSON structure');
                 return false;
             }
             return turf.booleanValid(geoJson);
         } catch (error) {
-            console.log('Validation error:', error);
+            logger.error('GeoJSON validation error:', error);
             return false;
         }
     }
 
     /**
      * Generate sampling points within the polygon
-     * @private
+     * @param {Object} geoJson - GeoJSON polygon
+     * @returns {Object} - GeoJSON FeatureCollection of points
      */
     static generateSamplingPoints(geoJson) {
-        // Calculate appropriate sampling density based on area size
         const area = turf.area(geoJson);
         const samplingDensity = this.calculateSamplingDensity(area);
-
-        // Generate grid of points
         const bbox = turf.bbox(geoJson);
-        const options = {
-            units: 'meters',
-            mask: geoJson
-        };
-
+        const options = { units: 'meters', mask: geoJson };
         return turf.pointGrid(bbox, samplingDensity, options);
     }
 
     /**
-     * Calculate appropriate sampling density based on area
-     * @private
+     * Calculate sampling density based on area size
+     * @param {number} area - Area in square meters
+     * @returns {number} - Distance between sampling points in meters
      */
     static calculateSamplingDensity(area) {
-        // Base density on area size to balance accuracy and API calls
         const baseDistance = Math.sqrt(area) / 20; // Aim for ~400 points
-        return Math.max(50, Math.min(200, baseDistance)); // Min 50m, max 200m between points
+        return Math.max(50, Math.min(200, baseDistance)); // Min 50m, max 200m
     }
 
     /**
      * Fetch elevation data for multiple points with rate limiting
-     * @private
+     * @param {Object} points - GeoJSON FeatureCollection of points
+     * @returns {Promise<Object[]>} - Array of elevation data objects
      */
     static async fetchElevationData(points) {
-        const results = [];
         const coordinates = points.features.map(f => f.geometry.coordinates);
+        const results = [];
+        const batchSize = Math.min(this.MAX_BATCH_SIZE, Math.ceil(coordinates.length / 10));
 
-        for (let i = 0; i < coordinates.length; i += 10) { // Process in batches of 10
-            const batch = coordinates.slice(i, i + 10);
-            await new Promise(resolve => setTimeout(resolve, 1000)); // Rate limiting
+        for (let i = 0; i < coordinates.length; i += batchSize) {
+            const batch = coordinates.slice(i, i + batchSize);
+            await new Promise(resolve => setTimeout(resolve, this.REQUEST_DELAY_MS));
 
             const batchPromises = batch.map(coord =>
                 this.fetchSinglePointElevation(coord[1], coord[0])
@@ -150,22 +199,20 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Fetch elevation for a single point
-     * @private
+     * @param {number} lat - Latitude
+     * @param {number} lon - Longitude
+     * @returns {Promise<Object>} - Elevation data object
      */
     static async fetchSinglePointElevation(lat, lon) {
         try {
-            const response = await axios.get(this.GMRT_API_URL, {
-                params: {
-                    longitude: lon,
-                    latitude: lat,
-                    format: 'json'
-                },
-                timeout: 5000
-            });
+            const response = await axios.get(`${this.GMRT_API_URL}?longitude=${lon}&latitude=${lat}&format=json`, { timeout: 5000 });
+            if (!response.data || typeof response.data.elevation !== 'string') {
+                throw new Error('Invalid elevation data received from API');
+            }
 
             return {
                 coordinates: [lon, lat],
-                elevation: response.data.elevation
+                elevation: parseFloat(response.data.elevation)
             };
         } catch (error) {
             logger.error(`Elevation fetch failed for ${lat},${lon}: ${error.message}`);
@@ -175,7 +222,9 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Perform comprehensive analysis of the area
-     * @private
+     * @param {Object} geoJson - GeoJSON polygon
+     * @param {Object[]} elevationData - Array of elevation data objects
+     * @returns {Promise<Object>} - Analysis results
      */
     static async performAnalysis(geoJson, elevationData) {
         const area = turf.area(geoJson);
@@ -195,23 +244,23 @@ class AgriculturalLandAnalyzer {
 
         // Calculate slope statistics
         const slopeStats = this.calculateSlopeStatistics(elevationSurface);
-
+        console.log('Slope stats:', slopeStats);
         // Analyze terrain characteristics
         const terrainAnalysis = this.analyzeTerrainCharacteristics(elevationSurface, slopeStats);
-
+        console.log('Terrain analysis:', terrainAnalysis);
         // Assess crop suitability
         const cropSuitability = this.assessCropSuitability(slopeStats, terrainAnalysis);
-
+        console.log('Crop suitability:', cropSuitability);
         // Calculate ROI factors
         const roiAnalysis = this.calculateROIFactors(area, slopeStats, terrainAnalysis);
-
+        console.log('ROI analysis:', roiAnalysis);
         return {
             areaCharacteristics: {
                 totalArea: area,
                 elevationRange: {
                     min: Math.min(...elevationData.map(d => d.elevation)),
                     max: Math.max(...elevationData.map(d => d.elevation)),
-                    mean: this.calculateMean(elevationData.map(d => d.elevation))
+                    mean: StatisticsUtils.mean(elevationData.map(d => d.elevation))
                 },
                 slope: slopeStats
             },
@@ -224,11 +273,12 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Calculate detailed slope statistics
-     * @private
+     * @param {Object} elevationSurface - TIN elevation surface
+     * @returns {Object} - Slope statistics
      */
     static calculateSlopeStatistics(elevationSurface) {
         const slopes = [];
-
+        console.log('Calculating slope statistics...');
         // Calculate slopes between all adjacent points in TIN
         elevationSurface.features.forEach(triangle => {
             const coords = triangle.geometry.coordinates[0];
@@ -242,10 +292,11 @@ class AgriculturalLandAnalyzer {
             }
         });
 
+        console.log('Slope statistics calculated:', slopes);
         return {
-            mean: this.calculateMean(slopes),
-            median: this.calculateMedian(slopes),
-            stdDev: this.calculateStdDev(slopes),
+            mean: StatisticsUtils.mean(slopes),
+            median: StatisticsUtils.median(slopes),
+            stdDev: StatisticsUtils.stdDev(slopes),
             distribution: this.calculateSlopeDistribution(slopes),
             aspectAnalysis: this.analyzeAspects(elevationSurface)
         };
@@ -253,7 +304,9 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Analyze terrain characteristics
-     * @private
+     * @param {Object} elevationSurface - TIN elevation surface
+     * @param {Object} slopeStats - Slope statistics
+     * @returns {Object} - Terrain analysis results
      */
     static analyzeTerrainCharacteristics(elevationSurface, slopeStats) {
         return {
@@ -267,7 +320,9 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Assess crop suitability for different agricultural uses
-     * @private
+     * @param {Object} slopeStats - Slope statistics
+     * @param {Object} terrainAnalysis - Terrain analysis results
+     * @returns {Object} - Crop suitability analysis
      */
     static assessCropSuitability(slopeStats, terrainAnalysis) {
         const suitability = {};
@@ -289,7 +344,10 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Calculate ROI factors
-     * @private
+     * @param {number} area - Area in square meters
+     * @param {Object} slopeStats - Slope statistics
+     * @param {Object} terrainAnalysis - Terrain analysis results
+     * @returns {Object} - ROI analysis results
      */
     static calculateROIFactors(area, slopeStats, terrainAnalysis) {
         return {
@@ -303,11 +361,22 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Calculate slope between two points with elevation
-     * @private
+     * @param {number[]} point1 - First point coordinates [lon, lat]
+     * @param {number[]} point2 - Second point coordinates [lon, lat]
+     * @param {Object} properties - Elevation properties
+     * @returns {number} - Slope in degrees
      */
     static calculateSlopeBetweenPoints(point1, point2, properties) {
+        console.log('Calculating slope between points:', point1, point2);
+        console.log('Properties:', JSON.stringify(properties));
+        if (!point1 || !point2 || !properties) {
+            throw new Error('Invalid input: points and properties are required');
+        }
+
         const [x1, y1] = point1;
         const [x2, y2] = point2;
+
+        console.log('x1:', x1, 'y1:', y1, 'x2:', x2, 'y2:', y2);
 
         // Calculate horizontal distance using Haversine formula
         const distance = turf.distance(
@@ -316,48 +385,20 @@ class AgriculturalLandAnalyzer {
             { units: 'meters' }
         );
 
+        console.log('Distance:', distance);
+
         // Calculate elevation difference
-        const elevDiff = Math.abs(properties.elevation[0] - properties.elevation[1]);
+        const elevDiff = Math.abs(properties.a - properties.b);
+        console.log('elevDiff:', elevDiff);
 
         // Calculate slope in degrees
         return Math.atan2(elevDiff, distance) * (180 / Math.PI);
     }
 
     /**
-     * Calculate the mean of an array of numbers
-     * @private
-     */
-    static calculateMean(values) {
-        return values.reduce((sum, val) => sum + val, 0) / values.length;
-    }
-
-    /**
-     * Calculate the median of an array of numbers
-     * @private
-     */
-    static calculateMedian(values) {
-        const sorted = [...values].sort((a, b) => a - b);
-        const middle = Math.floor(sorted.length / 2);
-
-        if (sorted.length % 2 === 0) {
-            return (sorted[middle - 1] + sorted[middle]) / 2;
-        }
-        return sorted[middle];
-    }
-
-    /**
-     * Calculate standard deviation
-     * @private
-     */
-    static calculateStdDev(values) {
-        const mean = this.calculateMean(values);
-        const squareDiffs = values.map(value => Math.pow(value - mean, 2));
-        return Math.sqrt(this.calculateMean(squareDiffs));
-    }
-
-    /**
      * Calculate slope distribution across classes
-     * @private
+     * @param {number[]} slopes - Array of slope values
+     * @returns {Object} - Slope distribution
      */
     static calculateSlopeDistribution(slopes) {
         const distribution = {};
@@ -377,7 +418,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Analyze aspects (slope direction) of the terrain
-     * @private
+     * @param {Object} elevationSurface - TIN elevation surface
+     * @returns {Object} - Aspect analysis results
      */
     static analyzeAspects(elevationSurface) {
         const aspects = [];
@@ -397,7 +439,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Calculate aspect of a triangle
-     * @private
+     * @param {Object} triangle - Triangle feature
+     * @returns {number} - Aspect in degrees
      */
     static calculateTriangleAspect(triangle) {
         const [p1, p2, p3] = triangle.geometry.coordinates[0];
@@ -410,7 +453,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Analyze drainage patterns
-     * @private
+     * @param {Object} elevationSurface - TIN elevation surface
+     * @returns {Object} - Drainage analysis results
      */
     static analyzeDrainage(elevationSurface) {
         const flowAccumulation = this.calculateFlowAccumulation(elevationSurface);
@@ -423,7 +467,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Calculate flow accumulation
-     * @private
+     * @param {Object} elevationSurface - TIN elevation surface
+     * @returns {Object} - Flow accumulation grid
      */
     static calculateFlowAccumulation(elevationSurface) {
         // Simplified D8 flow algorithm
@@ -433,7 +478,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Convert TIN to regular grid
-     * @private
+     * @param {Object} elevationSurface - TIN elevation surface
+     * @returns {Object} - Regular grid
      */
     static convertToGrid(elevationSurface) {
         const bbox = turf.bbox(elevationSurface);
@@ -445,22 +491,78 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Calculate D8 flow accumulation
+     * @param {Object} grid - Regular grid
+     * @returns {Object} - Flow accumulation grid
+     */
+    /**
+     * Calculate D8 flow accumulation
      * @private
      */
     static d8FlowAccumulation(grid) {
-        // Simplified implementation for demonstration
-        return grid.features.map(cell => ({
-            ...cell,
-            properties: {
-                ...cell.properties,
-                accumulation: Math.random() // Would be actual calculation in production
+        const rows = Math.sqrt(grid.features.length);
+        const cells = grid.features.map(f => f.properties.elevation);
+        const flowAccumulation = new Array(cells.length).fill(1);
+        const flowDirections = new Array(cells.length).fill(-1);
+
+        // Calculate flow directions
+        for (let i = 0; i < cells.length; i++) {
+            const neighbors = [];
+            const row = Math.floor(i / rows);
+            const col = i % rows;
+
+            // Check all 8 neighbors
+            for (let dr = -1; dr <= 1; dr++) {
+                for (let dc = -1; dc <= 1; dc++) {
+                    if (dr === 0 && dc === 0) continue;
+
+                    const r = row + dr;
+                    const c = col + dc;
+
+                    if (r >= 0 && r < rows && c >= 0 && c < rows) {
+                        const neighborIdx = r * rows + c;
+                        const slope = (cells[i] - cells[neighborIdx]) /
+                            Math.sqrt(dr * dr + dc * dc);
+                        neighbors.push({ index: neighborIdx, slope: slope });
+                    }
+                }
             }
-        }));
+
+            // Find steepest downslope neighbor
+            const steepest = neighbors.reduce((max, curr) =>
+                curr.slope > max.slope ? curr : max,
+                { slope: -Infinity });
+
+            if (steepest.slope > 0) {
+                flowDirections[i] = steepest.index;
+            }
+        }
+
+        // Calculate flow accumulation
+        for (let i = 0; i < cells.length; i++) {
+            let currentCell = i;
+            while (flowDirections[currentCell] !== -1) {
+                currentCell = flowDirections[currentCell];
+                flowAccumulation[currentCell]++;
+            }
+        }
+
+        // Map accumulation values back to grid features
+        return {
+            type: "FeatureCollection",
+            features: grid.features.map((cell, index) => ({
+                ...cell,
+                properties: {
+                    ...cell.properties,
+                    accumulation: flowAccumulation[index]
+                }
+            }))
+        };
     }
 
     /**
      * Calculate erosion risk
-     * @private
+     * @param {Object} slopeStats - Slope statistics
+     * @returns {Object} - Erosion risk analysis
      */
     static calculateErosionRisk(slopeStats) {
         const { mean: meanSlope, stdDev: slopeStdDev } = slopeStats;
@@ -483,7 +585,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Calculate water retention capacity
-     * @private
+     * @param {Object} slopeStats - Slope statistics
+     * @returns {Object} - Water retention analysis
      */
     static calculateWaterRetention(slopeStats) {
         const { mean: meanSlope, distribution } = slopeStats;
@@ -505,7 +608,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Analyze solar exposure
-     * @private
+     * @param {Object} elevationSurface - TIN elevation surface
+     * @returns {Object} - Solar exposure analysis
      */
     static analyzeSolarExposure(elevationSurface) {
         const aspects = this.analyzeAspects(elevationSurface);
@@ -525,7 +629,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Calculate terrain complexity
-     * @private
+     * @param {Object} elevationSurface - TIN elevation surface
+     * @returns {Object} - Terrain complexity analysis
      */
     static calculateTerrainComplexity(elevationSurface) {
         const slopes = elevationSurface.features.map(triangle =>
@@ -537,14 +642,17 @@ class AgriculturalLandAnalyzer {
         );
 
         return {
-            score: this.calculateStdDev(slopes) / 45,
-            variability: this.calculateMean(slopes.map(s => Math.abs(s - this.calculateMean(slopes))))
+            score: StatisticsUtils.stdDev(slopes) / 45,
+            variability: StatisticsUtils.mean(slopes.map(s => Math.abs(s - StatisticsUtils.mean(slopes))))
         };
     }
 
     /**
      * Calculate crop suitability score
-     * @private
+     * @param {string} cropType - Type of crop
+     * @param {Object} slopeStats - Slope statistics
+     * @param {Object} terrainAnalysis - Terrain analysis results
+     * @returns {Object} - Crop suitability score
      */
     static calculateCropSuitabilityScore(cropType, slopeStats, terrainAnalysis) {
         const factors = this.CROP_FACTORS;
@@ -580,27 +688,86 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
-     * Calculate elevation score (maintained for backward compatibility)
+     * Calculate slope suitability
+     * @param {number} slope - Mean slope in degrees
+     * @param {Object} weights - Slope weights for the crop
+     * @returns {number} - Slope suitability score
      */
-    static calculateElevationScore(elevation) {
-        const optimalRange = { min: 0, max: 2000 }; // meters
-        const elevation_value = parseFloat(elevation);
+    static calculateSlopeSuitability(slope, weights) {
+        if (slope <= weights.optimal) return 1.0;
+        if (slope <= weights.max) return 1.0 - ((slope - weights.optimal) / (weights.max - weights.optimal));
+        return 0.0;
+    }
 
-        if (elevation_value < optimalRange.min) {
-            return 0;
+    /**
+     * Calculate elevation suitability
+     * @param {number} elevation - Mean elevation in meters
+     * @param {Object} range - Elevation range for the crop
+     * @returns {number} - Elevation suitability score
+     */
+    static calculateElevationSuitability(elevation, range) {
+        if (elevation < range.min || elevation > range.max) return 0.0;
+        return 1.0 - (Math.abs(elevation - (range.min + range.max) / 2) / ((range.max - range.min) / 2));
+    }
+
+    /**
+     * Generate suitability zones
+     * @param {Object} suitabilityScores - Crop suitability scores
+     * @returns {Object[]} - Suitability zones
+     */
+    static generateSuitabilityZones(suitabilityScores) {
+        const zones = [];
+
+        Object.entries(suitabilityScores).forEach(([cropType, assessment]) => {
+            if (assessment.score > 0.7) {
+                zones.push({
+                    type: 'Optimal',
+                    crop: cropType,
+                    score: assessment.score
+                });
+            } else if (assessment.score > 0.4) {
+                zones.push({
+                    type: 'Suitable',
+                    crop: cropType,
+                    score: assessment.score
+                });
+            }
+        });
+
+        return zones;
+    }
+
+    /**
+     * Identify crop limitations
+     * @param {Object} slopeStats - Slope statistics
+     * @param {Object} terrainAnalysis - Terrain analysis results
+     * @returns {Object[]} - Crop limitations
+     */
+    static identifyCropLimitations(slopeStats, terrainAnalysis) {
+        const limitations = [];
+
+        if (slopeStats.mean > 15) {
+            limitations.push({
+                type: 'Slope',
+                description: 'Steep slopes may require terracing or other conservation measures'
+            });
         }
 
-        if (elevation_value > optimalRange.max) {
-            return Math.max(0, 1 - ((elevation_value - optimalRange.max) / 1000));
+        if (terrainAnalysis.drainage.waterloggingRisk > 0.5) {
+            limitations.push({
+                type: 'Drainage',
+                description: 'Poor drainage may require additional infrastructure'
+            });
         }
 
-        // Calculate score within optimal range
-        return 1 - (elevation_value / optimalRange.max) * 0.3;
+        return limitations;
     }
 
     /**
      * Estimate development costs
-     * @private
+     * @param {number} area - Area in square meters
+     * @param {Object} slopeStats - Slope statistics
+     * @returns {Object} - Development cost analysis
      */
     static estimateDevelopmentCosts(area, slopeStats) {
         const baseCost = 5000; // Base cost per hectare in USD
@@ -624,7 +791,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Assess maintenance requirements
-     * @private
+     * @param {Object} terrainAnalysis - Terrain analysis results
+     * @returns {Object} - Maintenance requirements
      */
     static assessMaintenanceRequirements(terrainAnalysis) {
         const requirements = [];
@@ -659,7 +827,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Calculate annual maintenance cost estimate
-     * @private
+     * @param {Object} scores - Maintenance scores
+     * @returns {number} - Annual maintenance cost
      */
     static calculateAnnualMaintenance(scores) {
         const baseCost = 1000; // USD per hectare
@@ -672,7 +841,8 @@ class AgriculturalLandAnalyzer {
 
     /**
      * Estimate productivity potential
-     * @private
+     * @param {Object} terrainAnalysis - Terrain analysis results
+     * @returns {Object} - Productivity potential analysis
      */
     static estimateProductivityPotential(terrainAnalysis) {
         const baseScore = 1;
@@ -695,34 +865,40 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
-     * Generate suitability zones
-     * @private
+     * Assess risk factors
+     * @param {Object} slopeStats - Slope statistics
+     * @param {Object} terrainAnalysis - Terrain analysis results
+     * @returns {Object} - Risk factors analysis
      */
-    static generateSuitabilityZones(suitabilityScores) {
-        const zones = [];
+    static assessRiskFactors(slopeStats, terrainAnalysis) {
+        return {
+            erosionRisk: terrainAnalysis.erosionRisk,
+            waterloggingRisk: terrainAnalysis.drainage.waterloggingRisk,
+            solarRisk: 1 - terrainAnalysis.solarExposure.score
+        };
+    }
 
-        Object.entries(suitabilityScores).forEach(([cropType, assessment]) => {
-            if (assessment.score > 0.7) {
-                zones.push({
-                    type: 'Optimal',
-                    crop: cropType,
-                    score: assessment.score
-                });
-            } else if (assessment.score > 0.4) {
-                zones.push({
-                    type: 'Suitable',
-                    crop: cropType,
-                    score: assessment.score
-                });
-            }
-        });
+    /**
+     * Calculate sustainability score
+     * @param {Object} terrainAnalysis - Terrain analysis results
+     * @returns {number} - Sustainability score
+     */
+    static calculateSustainabilityScore(terrainAnalysis) {
+        const baseScore = 1;
+        const adjustments = {
+            erosion: 1 - (terrainAnalysis.erosionRisk.score * 0.5),
+            drainage: 1 - (terrainAnalysis.drainage.waterloggingRisk * 0.3),
+            solar: terrainAnalysis.solarExposure.score * 0.2
+        };
 
-        return zones;
+        return baseScore * adjustments.erosion * adjustments.drainage * (1 + adjustments.solar);
     }
 
     /**
      * Generate recommendations based on analysis
-     * @private
+     * @param {Object} cropSuitability - Crop suitability analysis
+     * @param {Object} roiAnalysis - ROI analysis results
+     * @returns {Object[]} - Recommendations
      */
     static generateRecommendations(cropSuitability, roiAnalysis) {
         const recommendations = [];
@@ -756,7 +932,6 @@ class AgriculturalLandAnalyzer {
 
         return recommendations;
     }
-
 }
 
 module.exports = AgriculturalLandAnalyzer;
