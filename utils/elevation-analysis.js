@@ -923,7 +923,7 @@ class AgriculturalLandAnalyzer {
      */
     static convertToGrid(elevationSurface) {
         const bbox = turf.bbox(elevationSurface);
-        const cellSize = (bbox[2] - bbox[0]) / 30; // 30x30 grid
+        const cellSize = (bbox[2] - bbox[0]) / 20; // 20x20 grid
         return turf.pointGrid(bbox, cellSize, {
             properties: { elevation: 0 }
         });
@@ -935,43 +935,57 @@ class AgriculturalLandAnalyzer {
      * @returns {Object} - Flow accumulation grid
      */
     static d8FlowAccumulation(grid) {
+        // Use TypedArrays for better memory efficiency
         const rows = Math.sqrt(grid.features.length);
-        const cells = grid.features.map(f => f.properties.elevation);
-        const flowAccumulation = new Array(cells.length).fill(1);
-        const flowDirections = new Array(cells.length).fill(-1);
+        const cells = new Float32Array(grid.features.map(f => f.properties.elevation));
+        const flowAccumulation = new Uint32Array(cells.length).fill(1);
+        const flowDirections = new Int32Array(cells.length).fill(-1);
 
-        console.log('rows -> ', rows);
-        console.log('cells -> ', cells);
-        console.log('flowAccumulation -> ', flowAccumulation);
-        console.log('flowDirections -> ', flowDirections);
+        // Chunk processing for depression filling
+        const chunkSize = 10000;
+        const filledCells = this.fillDepressionsInChunks(cells, rows, chunkSize);
 
-        // Depression filling
-        const filledCells = this.fillDepressions(cells, rows);
-        console.log('filledCells -> ', filledCells);
+        // Parallel processing for flow directions
+        const chunks = this.splitIntoChunks(filledCells, chunkSize);
+        chunks.forEach((chunk, startIndex) => {
+            for (let i = 0; i < chunk.length; i++) {
+                const absoluteIndex = startIndex * chunkSize + i;
+                const neighbors = this.getNeighbors(absoluteIndex, rows, filledCells);
 
-        // Calculate flow directions with flat resolution
-        for (let i = 0; i < filledCells.length; i++) {
-            const neighbors = this.getNeighbors(i, rows, filledCells);
-            const flatArea = this.identifyFlatArea(i, neighbors, filledCells);
+                // Use Set for faster lookups
+                const flatArea = new Set(this.identifyFlatArea(absoluteIndex, neighbors, filledCells));
 
-            if (flatArea.length > 0) {
-                this.resolveFlatArea(flatArea, flowDirections, rows, filledCells);
-            } else {
-                flowDirections[i] = this.findSteepestDescent(i, neighbors);
+                if (flatArea.size > 0) {
+                    this.resolveFlatArea(Array.from(flatArea), flowDirections, rows, filledCells);
+                } else {
+                    flowDirections[absoluteIndex] = this.findSteepestDescent(absoluteIndex, neighbors);
+                }
             }
-        }
+        });
 
-        // Calculate flow accumulation
+        console.log('Flow directions calculated.');
+
+        // Optimize flow accumulation calculation
+        const visited = new Uint8Array(cells.length);
         for (let i = 0; i < filledCells.length; i++) {
+            if (visited[i]) continue;
+
             let currentCell = i;
-            let visited = new Set();
+            const path = [];
 
-            while (flowDirections[currentCell] !== -1 && !visited.has(currentCell)) {
-                visited.add(currentCell);
+            while (flowDirections[currentCell] !== -1 && !visited[currentCell]) {
+                visited[currentCell] = 1;
+                path.push(currentCell);
                 currentCell = flowDirections[currentCell];
-                flowAccumulation[currentCell]++;
             }
+
+            // Batch update accumulation values
+            path.forEach(cell => {
+                flowAccumulation[currentCell]++;
+            });
         }
+
+        console.log('Flow accumulation calculated.');
 
         return {
             type: "FeatureCollection",
@@ -986,6 +1000,50 @@ class AgriculturalLandAnalyzer {
         };
     }
 
+    // Helper method for chunked processing
+    static splitIntoChunks(array, chunkSize) {
+        const chunks = [];
+        for (let i = 0; i < array.length; i += chunkSize) {
+            chunks.push(array.slice(i, Math.min(i + chunkSize, array.length)));
+        }
+        return chunks;
+    }
+
+    // Optimized depression filling with chunking
+    static fillDepressionsInChunks(cells, rows, chunkSize) {
+        const filled = new Float32Array(cells);
+        const chunks = this.splitIntoChunks(filled, chunkSize);
+
+        let changed;
+        do {
+            changed = false;
+            chunks.forEach((chunk, startIndex) => {
+                const chunkChanged = this.processDepressionChunk(chunk, startIndex, rows, filled);
+                changed = changed || chunkChanged;
+            });
+        } while (changed);
+
+        return filled;
+    }
+
+    static processDepressionChunk(chunk, startIndex, rows, filled) {
+        let chunkChanged = false;
+        const chunkSize = chunk.length;
+        
+        for (let i = 0; i < chunkSize; i++) {
+            const absoluteIndex = startIndex + i;
+            const neighbors = this.getNeighbors(absoluteIndex, rows, filled);
+            const lowestNeighbor = Math.min(...neighbors.map(n => n.elevation));
+            
+            if (filled[absoluteIndex] < lowestNeighbor) {
+                filled[absoluteIndex] = lowestNeighbor;
+                chunkChanged = true;
+            }
+        }
+        
+        return chunkChanged;
+    }
+    
     static fillDepressions(cells, rows) {
         const filled = [...cells];
         let changed;

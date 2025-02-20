@@ -135,3 +135,58 @@
 {"level":"info","message":"Elevation data fetch progress: 80%"}
 {"level":"info","message":"Elevation data fetch progress: 90%"}
 {"level":"info","message":"Elevation fetch complete: 100.00% success rate"}
+{"level":"info","message":"Starting analysis for GeoJSON area"}
+{"level":"info","message":"Starting elevation data fetch for 60 points"}
+{"level":"info","message":"Elevation data fetch progress: 0%"}
+{"level":"info","message":"Elevation data fetch progress: 10%"}
+{"level":"info","message":"Elevation data fetch progress: 20%"}
+{"level":"info","message":"Elevation data fetch progress: 30%"}
+{"level":"info","message":"Elevation data fetch progress: 40%"}
+{"level":"info","message":"Elevation data fetch progress: 50%"}
+{"level":"info","message":"Elevation data fetch progress: 60%"}
+{"level":"info","message":"Elevation data fetch progress: 70%"}
+{"level":"info","message":"Elevation data fetch progress: 80%"}
+{"level":"info","message":"Elevation data fetch progress: 90%"}
+{"level":"info","message":"Elevation fetch complete: 100.00% success rate"}
+{"level":"info","message":"Starting analysis for GeoJSON area"}
+{"level":"info","message":"Starting elevation data fetch for 60 points"}
+{"level":"info","message":"Elevation data fetch progress: 0%"}
+{"level":"info","message":"Elevation data fetch progress: 10%"}
+{"level":"info","message":"Elevation data fetch progress: 20%"}
+{"level":"info","message":"Elevation data fetch progress: 30%"}
+{"level":"info","message":"Elevation data fetch progress: 40%"}
+{"level":"info","message":"Elevation data fetch progress: 50%"}
+{"level":"info","message":"Elevation data fetch progress: 60%"}
+{"level":"info","message":"Elevation data fetch progress: 70%"}
+{"level":"info","message":"Elevation data fetch progress: 80%"}
+{"level":"info","message":"Elevation data fetch progress: 90%"}
+{"level":"info","message":"Elevation fetch complete: 100.00% success rate"}
+{"level":"info","message":"Retrieved 60 valid elevation points out of 60 total"}
+{"distribution":{"EXTREME":{"area":0,"description":"Not recommended for cultivation","percentage":0},"MODERATE":{"area":3146.61317904085,"description":"Suitable with minor conservation","percentage":50.51546391752577},"OPTIMAL":{"area":1648.2259509261596,"description":"Ideal for most crops","percentage":26.46048109965636},"STEEP":{"area":1412.765100793851,"description":"Requires significant conservation","percentage":22.68041237113402},"VERY_STEEP":{"area":21.405531830209863,"description":"Limited to specific crops","percentage":0.3436426116838488}},"level":"info","message":"Slope distribution calculated"}
+{"level":"error","message":"Error in area analysis: this.processDepressionChunk is not a function","stack":"TypeError: this.processDepressionChunk is not a function\n    at eval (webpack://mudhumenimodels/./utils/elevation-analysis.js?:987:35)\n    at Array.forEach (<anonymous>)\n    at AgriculturalLandAnalyzer.fillDepressionsInChunks (webpack://mudhumenimodels/./utils/elevation-analysis.js?:986:14)\n    at AgriculturalLandAnalyzer.d8FlowAccumulation (webpack://mudhumenimodels/./utils/elevation-analysis.js?:919:30)\n    at AgriculturalLandAnalyzer.calculateFlowAccumulation (webpack://mudhumenimodels/./utils/elevation-analysis.js?:829:17)\n    at AgriculturalLandAnalyzer.analyzeDrainage (webpack://mudhumenimodels/./utils/elevation-analysis.js?:810:35)\n    at AgriculturalLandAnalyzer.analyzeTerrainCharacteristics (webpack://mudhumenimodels/./utils/elevation-analysis.js?:513:22)\n    at AgriculturalLandAnalyzer.performAnalysis (webpack://mudhumenimodels/./utils/elevation-analysis.js?:454:34)\n    at AgriculturalLandAnalyzer.analyzeArea (webpack://mudhumenimodels/./utils/elevation-analysis.js?:199:35)\n    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)"}
+{"level":"info","message":"Starting analysis for GeoJSON area"}
+{"level":"info","message":"Starting elevation data fetch for 60 points"}
+{"level":"info","message":"Elevation data fetch progress: 0%"}
+{"level":"info","message":"Elevation data fetch progress: 10%"}
+{"level":"info","message":"Elevation data fetch progress: 20%"}
+{"level":"info","message":"Elevation data fetch progress: 30%"}
+{"level":"info","message":"Elevation data fetch progress: 40%"}
+{"level":"info","message":"Elevation data fetch progress: 50%"}
+{"level":"info","message":"Elevation data fetch progress: 60%"}
+{"level":"info","message":"Elevation data fetch progress: 70%"}
+{"level":"info","message":"Elevation data fetch progress: 80%"}
+{"level":"info","message":"Elevation data fetch progress: 90%"}
+{"level":"info","message":"Elevation fetch complete: 100.00% success rate"}
+{"level":"info","message":"Starting analysis for GeoJSON area"}
+{"level":"info","message":"Starting elevation data fetch for 60 points"}
+{"level":"info","message":"Elevation data fetch progress: 0%"}
+{"level":"info","message":"Elevation data fetch progress: 10%"}
+{"level":"info","message":"Elevation data fetch progress: 20%"}
+{"level":"info","message":"Elevation data fetch progress: 30%"}
+{"level":"info","message":"Elevation data fetch progress: 40%"}
+{"level":"info","message":"Elevation data fetch progress: 50%"}
+{"level":"info","message":"Elevation data fetch progress: 60%"}
+{"level":"info","message":"Elevation data fetch progress: 70%"}
+{"level":"info","message":"Elevation data fetch progress: 80%"}
+{"level":"info","message":"Elevation data fetch progress: 90%"}
+{"level":"info","message":"Elevation fetch complete: 100.00% success rate"}
