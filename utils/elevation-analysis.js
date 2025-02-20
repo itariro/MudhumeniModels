@@ -72,8 +72,10 @@ class StatisticsUtils {
             0.99: [63.657, 9.925, 5.841, 4.604, 4.032]
         };
 
+        const zScores = { 0.95: 1.96, 0.99: 2.576 };
+
         const df = values.length - 1;
-        const tValue = df <= 5 ? tTable[confidence][df - 1] : zScores[confidence];
+        const tValue = df <= 5 ? (tTable[confidence]?.[df - 1] || 1.96) : (zScores[confidence] || 1.96);
 
         // Use two-pass algorithm for better numerical stability
         const mean = this.mean(values);
@@ -126,6 +128,7 @@ class AgriculturalLandAnalyzer {
         }
     };
 
+    static POLYGON_AREA = 0;
     /**
      * Analyze an area defined by a GeoJSON polygon
      * @param {Object} geoJson - GeoJSON polygon defining the area
@@ -145,6 +148,11 @@ class AgriculturalLandAnalyzer {
 
             // Fetch elevation data for all points
             const elevationData = await this.fetchElevationData(samplingPoints);
+            if (elevationData.length < 2) {
+                logger.warn(`Insufficient elevation data: ${elevationData.length} valid points`);
+            }
+
+            console.log('Elevation data:', elevationData);
 
             // Perform comprehensive analysis
             const analysis = await this.performAnalysis(geoJson, elevationData);
@@ -190,18 +198,57 @@ class AgriculturalLandAnalyzer {
      * @returns {Object} - GeoJSON FeatureCollection of points
      */
     static generateSamplingPoints(geoJson) {
+        if (!turf.booleanValid(geoJson)) {
+            throw new Error('Invalid GeoJSON input');
+        }
+
         const area = turf.area(geoJson);
         const MAX_POINTS_PER_CHUNK = 1000;
+        const GRID_SPACING = 10; // 10 meters
 
         if (area > 1000000) { // 1 km²
             const chunks = this.divideIntoChunks(geoJson);
             return chunks.reduce((points, chunk) => {
-                const chunkPoints = this.generatePointsForChunk(chunk, MAX_POINTS_PER_CHUNK);
+                const chunkPoints = this.generateGridPoints(chunk, GRID_SPACING, MAX_POINTS_PER_CHUNK);
                 return turf.featureCollection([...points.features, ...chunkPoints.features]);
             }, turf.featureCollection([]));
         }
 
-        return this.generatePointsForChunk(geoJson, MAX_POINTS_PER_CHUNK);
+        return this.generateGridPoints(geoJson, GRID_SPACING, MAX_POINTS_PER_CHUNK);
+    }
+
+    static generateGridPoints(polygon, spacing, maxPoints) {
+        const bbox = turf.bbox(polygon);
+        const grid = turf.pointGrid(bbox, spacing, { units: 'meters' });
+
+        // Filter points to ensure they are within the polygon
+        const pointsWithinPolygon = turf.pointsWithinPolygon(grid, polygon);
+
+        // Limit the number of points to avoid overwhelming the system
+        if (pointsWithinPolygon.features.length > maxPoints) {
+            return turf.featureCollection(pointsWithinPolygon.features.slice(0, maxPoints));
+        }
+
+        return pointsWithinPolygon;
+    }
+
+    static divideIntoChunks(polygon) {
+        const bbox = turf.bbox(polygon);
+        const [minX, minY, maxX, maxY] = bbox;
+
+        // Divide the bounding box into 4 smaller chunks
+        const midX = (minX + maxX) / 2;
+        const midY = (minY + maxY) / 2;
+
+        const chunks = [
+            turf.bboxPolygon([minX, minY, midX, midY]),
+            turf.bboxPolygon([midX, minY, maxX, midY]),
+            turf.bboxPolygon([minX, midY, midX, maxY]),
+            turf.bboxPolygon([midX, midY, maxX, maxY]),
+        ];
+
+        // Filter chunks to ensure they intersect with the original polygon
+        return chunks.filter(chunk => turf.booleanIntersects(chunk, polygon));
     }
 
     /**
@@ -220,23 +267,72 @@ class AgriculturalLandAnalyzer {
      * @returns {Promise<Object[]>} - Array of elevation data objects
      */
     static async fetchElevationData(points) {
+        // Input validation
+        if (!points?.features?.length) {
+            throw new Error('Invalid points input: Empty or missing features array');
+        }
+
         const coordinates = points.features.map(f => f.geometry.coordinates);
         const results = [];
-        const batchSize = Math.min(this.MAX_BATCH_SIZE, Math.ceil(coordinates.length / 10));
+        const total = coordinates.length;
+
+        // Dynamic batch size calculation
+        const batchSize = this.getBatchSize(total);
+
+        // Exponential backoff configuration
+        const maxRetries = 3;
+        const backoff = (attempt) => this.REQUEST_DELAY_MS * Math.pow(2, attempt);
+
+        logger.info(`Starting elevation data fetch for ${total} points`);
 
         for (let i = 0; i < coordinates.length; i += batchSize) {
             const batch = coordinates.slice(i, i + batchSize);
-            await new Promise(resolve => setTimeout(resolve, this.REQUEST_DELAY_MS));
 
-            const batchPromises = batch.map(coord =>
-                this.fetchSinglePointElevation(coord[1], coord[0])
-            );
+            // Progress tracking
+            const progress = Math.round((i / total) * 100);
+            logger.info(`Elevation data fetch progress: ${progress}%`);
 
-            const batchResults = await Promise.allSettled(batchPromises);
+            // Implement retry with backoff
+            let attempt = 0;
+            let batchResults;
+
+            while (attempt < maxRetries) {
+                try {
+                    await new Promise(resolve => setTimeout(resolve, backoff(attempt)));
+                    const batchPromises = batch.map(coord =>
+                        this.fetchSinglePointElevation(coord[1], coord[0])
+                    );
+                    batchResults = await Promise.allSettled(batchPromises);
+                    break;
+                } catch (error) {
+                    attempt++;
+                    logger.warn(`Batch retry ${attempt}/${maxRetries} due to: ${error.message}`);
+                    if (attempt === maxRetries) {
+                        logger.error(`Failed to fetch batch after ${maxRetries} attempts`);
+                        throw error;
+                    }
+                }
+            }
             results.push(...batchResults.map(r => r.status === 'fulfilled' ? r.value : null));
         }
 
-        return results.filter(r => r !== null);
+        // Calculate and log success statistics
+        const validResults = results.filter(r => r !== null);
+        const successRate = (validResults.length / results.length) * 100;
+
+        logger.info(`Elevation fetch complete: ${successRate.toFixed(2)}% success rate`);
+        logger.info(`Retrieved ${validResults.length} valid elevation points out of ${results.length} total`);
+
+        return validResults;
+    }
+
+    // Helper method for dynamic batch size calculation
+    static getBatchSize(total) {
+        const OPTIMAL_BATCHES = 10;
+        return Math.min(
+            this.MAX_BATCH_SIZE,
+            Math.ceil(total / OPTIMAL_BATCHES)
+        );
     }
 
     /**
@@ -255,7 +351,7 @@ class AgriculturalLandAnalyzer {
         let retries = 3;
         while (retries > 0) {
             try {
-                const response = await axios.get(`${this.GMRT_API_URL}?longitude=${lon}&latitude=${lat}&format=json`);
+                const response = await axios.get(`${this.GMRT_API_URL}?longitude=${lon}&latitude=${lat}&format=json`, { timeout: 5000 });
                 if (!response.data?.elevation) {
                     throw new Error('Invalid elevation data');
                 }
@@ -272,6 +368,41 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
+ * Validates geographic coordinates
+ * @param {number} lat - Latitude value
+ * @param {number} lon - Longitude value
+ * @returns {boolean} - True if coordinates are valid
+ */
+    static isValidCoordinate(lat, lon) {
+        // Check if inputs are numbers and not NaN
+        if (typeof lat !== 'number' || typeof lon !== 'number' ||
+            Number.isNaN(lat) || Number.isNaN(lon)) {
+            logger.warn(`Invalid coordinate types: lat=${lat}, lon=${lon}`);
+            return false;
+        }
+
+        // Validate latitude range (-90 to 90)
+        if (lat < -90 || lat > 90) {
+            logger.warn(`Invalid latitude value: ${lat}`);
+            return false;
+        }
+
+        // Validate longitude range (-180 to 180)
+        if (lon < -180 || lon > 180) {
+            logger.warn(`Invalid longitude value: ${lon}`);
+            return false;
+        }
+
+        // Check for zero coordinates (often indicates bad data)
+        if (lat === 0 && lon === 0) {
+            logger.warn('Suspicious coordinates: both latitude and longitude are 0');
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
      * Perform comprehensive analysis of the area
      * @param {Object} geoJson - GeoJSON polygon
      * @param {Object[]} elevationData - Array of elevation data objects
@@ -279,6 +410,7 @@ class AgriculturalLandAnalyzer {
      */
     static async performAnalysis(geoJson, elevationData) {
         const area = turf.area(geoJson);
+        this.POLYGON_AREA = area;
         const points = elevationData.map(d => ({
             type: 'Feature',
             geometry: {
@@ -292,6 +424,7 @@ class AgriculturalLandAnalyzer {
 
         // Create elevation surface for analysis
         const elevationSurface = turf.tin(turf.featureCollection(points), 'elevation');
+        console.log('Elevation surface:', elevationSurface);
 
         // Calculate slope statistics
         const slopeStats = this.calculateSlopeStatistics(elevationSurface);
@@ -603,25 +736,63 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
-     * Calculate slope distribution across classes
-     * @param {number[]} slopes - Array of slope values
-     * @returns {Object} - Slope distribution
-     */
-    static calculateSlopeDistribution(slopes) {
-        const distribution = {};
-        let total = slopes.length;
+ * Calculate slope distribution across classes
+ * @param {number[]} slopes - Array of slope values in degrees
+ * @returns {Object.<string, {percentage: number, area: number, description: string}>} 
+ * @throws {Error} If slopes input is invalid
+ */
+    static #slopeDistributionCache = new WeakMap();
 
-        for (const [className, limits] of Object.entries(this.SLOPE_CLASSES)) {
-            const count = slopes.filter(slope => slope <= limits.max).length;
-            distribution[className] = {
+    static calculateSlopeDistribution(slopes) {
+        // Input validation
+        if (!Array.isArray(slopes) || slopes.length === 0) {
+            throw new Error('Invalid slopes input: Must be non-empty array');
+        }
+
+        // Check cache
+        const cacheKey = slopes;
+        if (this.#slopeDistributionCache.has(cacheKey)) {
+            return this.#slopeDistributionCache.get(cacheKey);
+        }
+
+        const total = slopes.length;
+
+        // Single-pass counting
+        const counts = new Map();
+        const sortedSlopes = [...slopes].sort((a, b) => a - b);
+
+        sortedSlopes.forEach(slope => {
+            for (const [className, limits] of Object.entries(this.SLOPE_CLASSES)) {
+                if (slope <= limits.max) {
+                    counts.set(className, (counts.get(className) || 0) + 1);
+                    break;
+                }
+            }
+        });
+
+        logger.info('sortedSlopes -> ', { sortedSlopes });
+
+        // Calculate distribution
+        const distribution = Object.entries(this.SLOPE_CLASSES).reduce((acc, [className, limits]) => {
+            const count = counts.get(className) || 0;
+            acc[className] = {
                 percentage: (count / total) * 100,
-                area: turf.area(this.polygon) * (count / total),
+                area: this.POLYGON_AREA * (count / total),
                 description: limits.description
             };
-        }
+            return acc;
+        }, {});
+
+        console.log('distribution -> ', distribution);
+
+        // Cache results
+        this.#slopeDistributionCache.set(cacheKey, Object.freeze(distribution));
+
+        logger.info('Slope distribution calculated', { distribution });
 
         return distribution;
     }
+
 
     /**
      * Analyze aspects (slope direction) of the terrain
