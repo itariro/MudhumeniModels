@@ -474,7 +474,6 @@ class AgriculturalLandAnalyzer {
                 slopes.push(slope);
             }
         });
-        console.log('slopes ->', slopes);
         const slopeConfidence = StatisticsUtils.confidenceInterval(slopes);
         return {
             mean: StatisticsUtils.mean(slopes),
@@ -770,8 +769,6 @@ class AgriculturalLandAnalyzer {
             }
         });
 
-        logger.info('sortedSlopes -> ', { sortedSlopes });
-
         // Calculate distribution
         const distribution = Object.entries(this.SLOPE_CLASSES).reduce((acc, [className, limits]) => {
             const count = counts.get(className) || 0;
@@ -782,8 +779,6 @@ class AgriculturalLandAnalyzer {
             };
             return acc;
         }, {});
-
-        console.log('distribution -> ', distribution);
 
         // Cache results
         this.#slopeDistributionCache.set(cacheKey, Object.freeze(distribution));
@@ -836,6 +831,7 @@ class AgriculturalLandAnalyzer {
      */
     static analyzeDrainage(elevationSurface) {
         const flowAccumulation = this.calculateFlowAccumulation(elevationSurface);
+        console.log('flowAccumulation -> ', flowAccumulation)
         return {
             drainagePattern: this.classifyDrainagePattern(flowAccumulation),
             drainageDensity: this.calculateDrainageDensity(flowAccumulation),
@@ -850,8 +846,74 @@ class AgriculturalLandAnalyzer {
      */
     static calculateFlowAccumulation(elevationSurface) {
         // Simplified D8 flow algorithm
+        console.log('Calculating flow accumulation...');
         const cells = this.convertToGrid(elevationSurface);
+        console.log('cells -> ', cells);
         return this.d8FlowAccumulation(cells);
+    }
+
+    /**
+ * Classify the drainage pattern based on flow accumulation
+ * @param {Object} flowAccumulation - Flow accumulation grid
+ * @returns {string} - Drainage pattern classification
+ */
+    static classifyDrainagePattern(flowAccumulation) {
+        const features = flowAccumulation.features;
+        const totalCells = features.length;
+        const highFlowCells = features.filter(f => f.properties.accumulation > 100).length;
+        const mediumFlowCells = features.filter(f => f.properties.accumulation > 50 && f.properties.accumulation <= 100).length;
+        const lowFlowCells = features.filter(f => f.properties.accumulation <= 50).length;
+
+        const highFlowPercentage = (highFlowCells / totalCells) * 100;
+        const mediumFlowPercentage = (mediumFlowCells / totalCells) * 100;
+        const lowFlowPercentage = (lowFlowCells / totalCells) * 100;
+
+        if (highFlowPercentage > 30) {
+            return 'Dendritic';
+        } else if (mediumFlowPercentage > 50) {
+            return 'Trellis';
+        } else if (lowFlowPercentage > 70) {
+            return 'Parallel';
+        } else {
+            return 'Rectangular';
+        }
+    }
+
+    /**
+     * Calculate drainage density
+     * @param {Object} flowAccumulation - Flow accumulation grid
+     * @returns {number} - Drainage density (km/km²)
+     */
+    static calculateDrainageDensity(flowAccumulation) {
+        const features = flowAccumulation.features;
+        const totalArea = this.POLYGON_AREA / 1e6; // Convert to square kilometers
+        const totalDrainageLength = features.reduce((sum, f) => {
+            return sum + (f.properties.accumulation > 10 ? 1 : 0); // Assuming each cell with accumulation > 10 represents a drainage channel
+        }, 0);
+
+        const cellSize = Math.sqrt(this.POLYGON_AREA / features.length); // Average cell size in meters
+        const drainageDensity = (totalDrainageLength * cellSize) / 1000 / totalArea; // Convert to km/km²
+
+        return drainageDensity;
+    }
+
+    /**
+     * Assess waterlogging risk based on flow accumulation
+     * @param {Object} flowAccumulation - Flow accumulation grid
+     * @returns {number} - Waterlogging risk score (0 to 1)
+     */
+    static assessWaterloggingRisk(flowAccumulation) {
+        const features = flowAccumulation.features;
+        const totalCells = features.length;
+        const highAccumulationCells = features.filter(f => f.properties.accumulation > 100).length;
+        const mediumAccumulationCells = features.filter(f => f.properties.accumulation > 50 && f.properties.accumulation <= 100).length;
+
+        const highRiskPercentage = (highAccumulationCells / totalCells) * 100;
+        const mediumRiskPercentage = (mediumAccumulationCells / totalCells) * 100;
+
+        const riskScore = (highRiskPercentage * 0.7) + (mediumRiskPercentage * 0.3);
+
+        return Math.min(1, riskScore / 100); // Normalize to 0-1 range
     }
 
     /**
@@ -861,7 +923,7 @@ class AgriculturalLandAnalyzer {
      */
     static convertToGrid(elevationSurface) {
         const bbox = turf.bbox(elevationSurface);
-        const cellSize = (bbox[2] - bbox[0]) / 50; // 50x50 grid
+        const cellSize = (bbox[2] - bbox[0]) / 30; // 30x30 grid
         return turf.pointGrid(bbox, cellSize, {
             properties: { elevation: 0 }
         });
@@ -878,8 +940,14 @@ class AgriculturalLandAnalyzer {
         const flowAccumulation = new Array(cells.length).fill(1);
         const flowDirections = new Array(cells.length).fill(-1);
 
+        console.log('rows -> ', rows);
+        console.log('cells -> ', cells);
+        console.log('flowAccumulation -> ', flowAccumulation);
+        console.log('flowDirections -> ', flowDirections);
+
         // Depression filling
         const filledCells = this.fillDepressions(cells, rows);
+        console.log('filledCells -> ', filledCells);
 
         // Calculate flow directions with flat resolution
         for (let i = 0; i < filledCells.length; i++) {
