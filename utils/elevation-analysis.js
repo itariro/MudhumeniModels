@@ -129,6 +129,9 @@ class AgriculturalLandAnalyzer {
     };
 
     static POLYGON_AREA = 0;
+    static MIN_SUITABILITY = 0.0;
+    static MAX_SUITABILITY = 1.0;
+
     /**
      * Analyze an area defined by a GeoJSON polygon
      * @param {Object} geoJson - GeoJSON polygon defining the area
@@ -433,7 +436,7 @@ class AgriculturalLandAnalyzer {
         const terrainAnalysis = this.analyzeTerrainCharacteristics(elevationSurface, slopeStats);
         console.log('Terrain analysis:', terrainAnalysis);
         // Assess crop suitability
-        const cropSuitability = this.assessCropSuitability(slopeStats, terrainAnalysis);
+        const cropSuitability = this.assessCropSuitability(slopeStats, terrainAnalysis, elevationSurface);
         console.log('Crop suitability:', cropSuitability);
         // Calculate ROI factors
         const roiAnalysis = this.calculateROIFactors(area, slopeStats, terrainAnalysis);
@@ -507,14 +510,15 @@ class AgriculturalLandAnalyzer {
      * @param {Object} terrainAnalysis - Terrain analysis results
      * @returns {Object} - Crop suitability analysis
      */
-    static assessCropSuitability(slopeStats, terrainAnalysis) {
+    static assessCropSuitability(slopeStats, terrainAnalysis, elevationSurface) {
         const suitability = {};
 
         for (const [cropType, factors] of Object.entries(this.CROP_FACTORS.SLOPE_WEIGHTS)) {
             suitability[cropType] = this.calculateCropSuitabilityScore(
                 cropType,
                 slopeStats,
-                terrainAnalysis
+                terrainAnalysis,
+                elevationSurface
             );
         }
 
@@ -923,7 +927,7 @@ class AgriculturalLandAnalyzer {
      */
     static convertToGrid(elevationSurface) {
         const bbox = turf.bbox(elevationSurface);
-        const cellSize = (bbox[2] - bbox[0]) / 20; // 20x20 grid
+        const cellSize = (bbox[2] - bbox[0]) / 5; // 5x5 grid
         return turf.pointGrid(bbox, cellSize, {
             properties: { elevation: 0 }
         });
@@ -1029,21 +1033,21 @@ class AgriculturalLandAnalyzer {
     static processDepressionChunk(chunk, startIndex, rows, filled) {
         let chunkChanged = false;
         const chunkSize = chunk.length;
-        
+
         for (let i = 0; i < chunkSize; i++) {
             const absoluteIndex = startIndex + i;
             const neighbors = this.getNeighbors(absoluteIndex, rows, filled);
             const lowestNeighbor = Math.min(...neighbors.map(n => n.elevation));
-            
+
             if (filled[absoluteIndex] < lowestNeighbor) {
                 filled[absoluteIndex] = lowestNeighbor;
                 chunkChanged = true;
             }
         }
-        
+
         return chunkChanged;
     }
-    
+
     static fillDepressions(cells, rows) {
         const filled = [...cells];
         let changed;
@@ -1116,6 +1120,38 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
+ * Classify erosion risk based on a risk score
+ * @param {number} riskScore - Erosion risk score (0 to 1)
+ * @returns {string} - Erosion risk classification
+ * @throws {Error} If riskScore is invalid
+ */
+    static classifyErosionRisk(riskScore) {
+        // Input validation
+        if (typeof riskScore !== 'number' || riskScore < 0 || riskScore > 1 || isNaN(riskScore)) {
+            throw new Error('Invalid riskScore: Must be a number between 0 and 1');
+        }
+
+        // Classification thresholds (based on FAO and USDA guidelines)
+        const RISK_CLASSES = [
+            { threshold: 0.2, classification: 'Very Low' },
+            { threshold: 0.4, classification: 'Low' },
+            { threshold: 0.6, classification: 'Moderate' },
+            { threshold: 0.8, classification: 'High' },
+            { threshold: 1.0, classification: 'Very High' }
+        ];
+
+        // Find the appropriate classification
+        for (const { threshold, classification } of RISK_CLASSES) {
+            if (riskScore <= threshold) {
+                return classification;
+            }
+        }
+
+        // Default to 'Very High' if score exceeds all thresholds
+        return 'Very High';
+    }
+
+    /**
      * Calculate water retention capacity
      * @param {Object} slopeStats - Slope statistics
      * @returns {Object} - Water retention analysis
@@ -1160,6 +1196,38 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
+ * Classify solar exposure based on a solar exposure score
+ * @param {number} exposureScore - Solar exposure score (0 to 1)
+ * @returns {string} - Solar exposure classification
+ * @throws {Error} If exposureScore is invalid
+ */
+    static classifySolarExposure(exposureScore) {
+        // Input validation
+        if (typeof exposureScore !== 'number' || exposureScore < 0 || exposureScore > 1 || isNaN(exposureScore)) {
+            throw new Error('Invalid exposureScore: Must be a number between 0 and 1');
+        }
+
+        // Classification thresholds (based on solar radiation models)
+        const EXPOSURE_CLASSES = [
+            { threshold: 0.3, classification: 'Low' },
+            { threshold: 0.5, classification: 'Moderate' },
+            { threshold: 0.7, classification: 'High' },
+            { threshold: 0.9, classification: 'Very High' },
+            { threshold: 1.0, classification: 'Optimal' }
+        ];
+
+        // Find the appropriate classification
+        for (const { threshold, classification } of EXPOSURE_CLASSES) {
+            if (exposureScore <= threshold) {
+                return classification;
+            }
+        }
+
+        // Default to 'Optimal' if score exceeds all thresholds
+        return 'Optimal';
+    }
+
+    /**
      * Calculate terrain complexity
      * @param {Object} elevationSurface - TIN elevation surface
      * @returns {Object} - Terrain complexity analysis
@@ -1186,17 +1254,30 @@ class AgriculturalLandAnalyzer {
      * @param {Object} terrainAnalysis - Terrain analysis results
      * @returns {Object} - Crop suitability score
      */
-    static calculateCropSuitabilityScore(cropType, slopeStats, terrainAnalysis) {
+    static calculateCropSuitabilityScore(cropType, slopeStats, terrainAnalysis, elevationSurface) {
         const factors = this.CROP_FACTORS;
         const weights = factors.SLOPE_WEIGHTS[cropType];
         const elevRange = factors.ELEVATION_RANGES[cropType];
 
         // Calculate base suitability
         const slopeSuitability = this.calculateSlopeSuitability(slopeStats.mean, weights);
+        
+        // Calculate base suitability
+        const elevationData = elevationSurface.features.map(f => f.properties.elevation);
+        const elevationStats = {
+            median: StatisticsUtils.median(elevationData),
+            confidence: StatisticsUtils.confidenceInterval(elevationData)
+        };
+
         const elevationSuitability = this.calculateElevationSuitability(
-            terrainAnalysis.elevation,
+            elevationStats.median,
             elevRange
         );
+
+        // const elevationSuitability = this.calculateElevationSuitability(
+        //     terrainAnalysis.elevation,
+        //     elevRange
+        // );
 
         // Adjust for other factors
         const drainageAdjustment = 1 - (terrainAnalysis.drainage.waterloggingRisk * 0.5);
@@ -1206,6 +1287,9 @@ class AgriculturalLandAnalyzer {
             elevationSuitability *
             drainageAdjustment *
             erosionAdjustment;
+
+        console.log('slopeSuitability:', slopeSuitability, 'elevationSuitability:', elevationSuitability, 'drainageAdjustment:', drainageAdjustment, 'erosionAdjustment:', erosionAdjustment);
+        console.log('score:', score);
 
         return {
             score,
@@ -1217,6 +1301,108 @@ class AgriculturalLandAnalyzer {
                 erosionAdjustment
             }
         };
+    }
+
+    /**
+ * Classify land suitability based on comprehensive score analysis
+ * @param {number} score - Suitability score between 0 and 1
+ * @returns {Object} - Detailed suitability classification with confidence levels
+ * @throws {Error} If score is invalid
+ */
+    static classifySuitability(score) {
+        // Input validation with specific error message
+        if (typeof score !== 'number' || score < 0 || score > 1 || Number.isNaN(score)) {
+            throw new Error('Suitability score must be a number between 0 and 1');
+        }
+
+        // Classification thresholds based on FAO land evaluation guidelines
+        const SUITABILITY_CLASSES = Object.freeze({
+            S1: { threshold: 0.85, name: 'Highly Suitable', confidence: 0.95 },
+            S2: { threshold: 0.70, name: 'Moderately Suitable', confidence: 0.85 },
+            S3: { threshold: 0.50, name: 'Marginally Suitable', confidence: 0.75 },
+            N1: { threshold: 0.30, name: 'Currently Not Suitable', confidence: 0.70 },
+            N2: { threshold: 0.00, name: 'Permanently Not Suitable', confidence: 0.90 }
+        });
+
+        // Performance optimization using early return
+        for (const [className, data] of Object.entries(SUITABILITY_CLASSES)) {
+            if (score >= data.threshold) {
+                return {
+                    class: className,
+                    name: data.name,
+                    score,
+                    confidence: data.confidence,
+                    limitations: this.calculateLimitations(score, data.threshold),
+                    recommendations: this.getSuitabilityRecommendations(className, score)
+                };
+            }
+        }
+
+        // Fallback classification (should never reach here due to threshold structure)
+        return {
+            class: 'N2',
+            name: SUITABILITY_CLASSES.N2.name,
+            score,
+            confidence: SUITABILITY_CLASSES.N2.confidence,
+            limitations: this.calculateLimitations(score, 0),
+            recommendations: this.getSuitabilityRecommendations('N2', score)
+        };
+    }
+
+    /**
+     * Calculate limitations based on score difference from threshold
+     * @private
+     * @param {number} score - Current suitability score
+     * @param {number} threshold - Classification threshold
+     * @returns {Object} - Limitation factors
+     */
+    static calculateLimitations(score, threshold) {
+        const limitationFactor = Math.max(0, (threshold - score) / threshold);
+        return {
+            severity: limitationFactor,
+            impact: limitationFactor > 0.5 ? 'Significant' : 'Moderate',
+            improvementPotential: Math.min(1, (1 - limitationFactor) * 1.5)
+        };
+    }
+
+    /**
+     * Generate specific recommendations based on suitability class
+     * @private
+     * @param {string} className - Suitability class identifier
+     * @param {number} score - Suitability score
+     * @returns {string[]} - Array of specific recommendations
+     */
+    static getSuitabilityRecommendations(className, score) {
+        const recommendations = new Set();
+
+        switch (className) {
+            case 'S1':
+                recommendations.add('Maintain current land management practices');
+                if (score < 0.95) {
+                    recommendations.add('Consider minor optimizations for maximum yield');
+                }
+                break;
+            case 'S2':
+                recommendations.add('Implement targeted improvements for specific limitations');
+                recommendations.add('Regular monitoring of soil conditions recommended');
+                break;
+            case 'S3':
+                recommendations.add('Significant improvements required for optimal production');
+                recommendations.add('Conduct detailed soil analysis');
+                recommendations.add('Consider alternative crop selections');
+                break;
+            case 'N1':
+                recommendations.add('Major land improvements required');
+                recommendations.add('Evaluate cost-benefit of land development');
+                recommendations.add('Consider temporary alternative land use');
+                break;
+            case 'N2':
+                recommendations.add('Land not recommended for agricultural use');
+                recommendations.add('Consider permanent alternative land use options');
+                break;
+        }
+
+        return Array.from(recommendations);
     }
 
     /**
@@ -1232,14 +1418,33 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
-     * Calculate elevation suitability
-     * @param {number} elevation - Mean elevation in meters
-     * @param {Object} range - Elevation range for the crop
-     * @returns {number} - Elevation suitability score
+     * Calculates elevation suitability score between 0.0 and 1.0
+     * @param {number} elevation - Elevation in meters
+     * @param {Object} range - Elevation range object with min/max values
+     * @returns {number} Suitability score between 0.0 and 1.0
+     * @throws {Error} If parameters are invalid
      */
     static calculateElevationSuitability(elevation, range) {
-        if (elevation < range.min || elevation > range.max) return 0.0;
-        return 1.0 - (Math.abs(elevation - (range.min + range.max) / 2) / ((range.max - range.min) / 2));
+        // Input validation
+        if (typeof elevation !== 'number' || !range?.min || !range?.max) {
+            throw new Error('Invalid elevation or range parameters');
+        }
+
+        // Range validation
+        if (range.max <= range.min) {
+            throw new Error('Invalid range: max must be greater than min');
+        }
+
+        // Check if elevation is within range
+        if (elevation < range.min || elevation > range.max) {
+            return this.MIN_SUITABILITY;
+        }
+
+        // Calculate suitability using intermediate variables
+        const midpoint = (range.min + range.max) / 2;
+        const halfRange = (range.max - range.min) / 2;
+
+        return this.MAX_SUITABILITY - (Math.abs(elevation - midpoint) / halfRange);
     }
 
     /**
@@ -1418,12 +1623,12 @@ class AgriculturalLandAnalyzer {
     static calculateSustainabilityScore(terrainAnalysis) {
         const baseScore = 1;
         const adjustments = {
-            erosion: 1 - (terrainAnalysis.erosionRisk.score * 0.5),
-            drainage: 1 - (terrainAnalysis.drainage.waterloggingRisk * 0.3),
-            solar: terrainAnalysis.solarExposure.score * 0.2
+            erosion: Math.max(0, Math.min(1, 1 - (terrainAnalysis.erosionRisk.score * 0.5))),
+            drainage: Math.max(0, Math.min(1, 1 - (terrainAnalysis.drainage.waterloggingRisk * 0.3))),
+            solar: Math.max(0, Math.min(1, terrainAnalysis.solarExposure.score * 0.2))
         };
 
-        return baseScore * adjustments.erosion * adjustments.drainage * (1 + adjustments.solar);
+        return Number((baseScore * adjustments.erosion * adjustments.drainage * (1 + adjustments.solar)).toFixed(2));
     }
 
     /**
