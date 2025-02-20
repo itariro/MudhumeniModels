@@ -43,6 +43,26 @@ class StatisticsUtils {
     }
 
     /**
+     * Calculate the maximum value in an array of numbers
+     * @param {number[]} values - Array of numbers
+     * @returns {number} - Maximum value
+     */
+    static max(values) {
+        if (!values.length) throw new Error('Input array cannot be empty');
+        return Math.max(...values);
+    }
+
+    /**
+     * Calculate the minimum value in an array of numbers
+     * @param {number[]} values - Array of numbers
+     * @returns {number} - Minimum value
+     */
+    static min(values) {
+        if (!values.length) throw new Error('Input array cannot be empty');
+        return Math.min(...values);
+    }
+
+    /**
      * Calculate the standard deviation of an array of numbers
      * @param {number[]} values - Array of numbers
      * @returns {number} - Standard deviation
@@ -131,6 +151,12 @@ class AgriculturalLandAnalyzer {
     static POLYGON_AREA = 0;
     static MIN_SUITABILITY = 0.0;
     static MAX_SUITABILITY = 1.0;
+    static FIELD_ELEVATION = {
+        MEAN: 0,
+        MEDIAN: 0,
+        MIN: 0,
+        MAX: 0
+    };
 
     /**
      * Analyze an area defined by a GeoJSON polygon
@@ -155,6 +181,15 @@ class AgriculturalLandAnalyzer {
                 logger.warn(`Insufficient elevation data: ${elevationData.length} valid points`);
             }
 
+            const elevations = this.extractElevations(elevationData);
+            const { mean, median, min, max } = StatisticsUtils;
+
+            this.FIELD_ELEVATION = {
+                MEAN: parseFloat(mean(elevations)),
+                MEDIAN: parseFloat(median(elevations)),
+                MIN: parseFloat(min(elevations)),
+                MAX: parseFloat(max(elevations))
+            };
             console.log('Elevation data:', elevationData);
 
             // Perform comprehensive analysis
@@ -167,6 +202,15 @@ class AgriculturalLandAnalyzer {
             logger.error('Error in area analysis:', error);
             throw new Error(`Agricultural land analysis failed: ${error.message}`);
         }
+    }
+
+    /**
+     * Extract the elevation values from the provided data.
+     * @param {Object[]} data - An array of data objects, each containing an 'elevation' property.
+     * @returns {number[]} - An array of elevation values extracted from the input data.
+     */
+    static extractElevations(data) {
+        return data.map(item => item.elevation);
     }
 
     /**
@@ -436,7 +480,7 @@ class AgriculturalLandAnalyzer {
         const terrainAnalysis = this.analyzeTerrainCharacteristics(elevationSurface, slopeStats);
         console.log('Terrain analysis:', terrainAnalysis);
         // Assess crop suitability
-        const cropSuitability = this.assessCropSuitability(slopeStats, terrainAnalysis, elevationSurface);
+        const cropSuitability = this.assessCropSuitability(slopeStats, terrainAnalysis);
         console.log('Crop suitability:', cropSuitability);
         // Calculate ROI factors
         const roiAnalysis = this.calculateROIFactors(area, slopeStats, terrainAnalysis);
@@ -510,15 +554,14 @@ class AgriculturalLandAnalyzer {
      * @param {Object} terrainAnalysis - Terrain analysis results
      * @returns {Object} - Crop suitability analysis
      */
-    static assessCropSuitability(slopeStats, terrainAnalysis, elevationSurface) {
+    static assessCropSuitability(slopeStats, terrainAnalysis) {
         const suitability = {};
 
         for (const [cropType, factors] of Object.entries(this.CROP_FACTORS.SLOPE_WEIGHTS)) {
             suitability[cropType] = this.calculateCropSuitabilityScore(
                 cropType,
                 slopeStats,
-                terrainAnalysis,
-                elevationSurface
+                terrainAnalysis
             );
         }
 
@@ -853,6 +896,7 @@ class AgriculturalLandAnalyzer {
         console.log('Calculating flow accumulation...');
         const cells = this.convertToGrid(elevationSurface);
         console.log('cells -> ', cells);
+        logger.info(cells);
         return this.d8FlowAccumulation(cells);
     }
 
@@ -1254,30 +1298,17 @@ class AgriculturalLandAnalyzer {
      * @param {Object} terrainAnalysis - Terrain analysis results
      * @returns {Object} - Crop suitability score
      */
-    static calculateCropSuitabilityScore(cropType, slopeStats, terrainAnalysis, elevationSurface) {
+    static calculateCropSuitabilityScore(cropType, slopeStats, terrainAnalysis) {
         const factors = this.CROP_FACTORS;
         const weights = factors.SLOPE_WEIGHTS[cropType];
         const elevRange = factors.ELEVATION_RANGES[cropType];
 
         // Calculate base suitability
         const slopeSuitability = this.calculateSlopeSuitability(slopeStats.mean, weights);
-        
-        // Calculate base suitability
-        const elevationData = elevationSurface.features.map(f => f.properties.elevation);
-        const elevationStats = {
-            median: StatisticsUtils.median(elevationData),
-            confidence: StatisticsUtils.confidenceInterval(elevationData)
-        };
-
         const elevationSuitability = this.calculateElevationSuitability(
-            elevationStats.median,
+            this.FIELD_ELEVATION.MEAN,
             elevRange
         );
-
-        // const elevationSuitability = this.calculateElevationSuitability(
-        //     terrainAnalysis.elevation,
-        //     elevRange
-        // );
 
         // Adjust for other factors
         const drainageAdjustment = 1 - (terrainAnalysis.drainage.waterloggingRisk * 0.5);
@@ -1426,7 +1457,9 @@ class AgriculturalLandAnalyzer {
      */
     static calculateElevationSuitability(elevation, range) {
         // Input validation
-        if (typeof elevation !== 'number' || !range?.min || !range?.max) {
+        if (typeof elevation !== 'number' ||
+            range?.min === undefined ||
+            range?.max === undefined) {
             throw new Error('Invalid elevation or range parameters');
         }
 
@@ -1665,6 +1698,197 @@ class AgriculturalLandAnalyzer {
                     rationale: 'High development costs suggest a phased approach to optimize ROI'
                 }]
             });
+        }
+
+        return recommendations;
+    }
+
+    /**
+ * Classify productivity potential based on comprehensive scoring
+ * @param {number} score - Productivity potential score between 0 and 1
+ * @returns {Object} Detailed productivity classification with confidence metrics
+ * @throws {Error} If score is invalid
+ */
+    static classifyProductivityPotential(score) {
+        // Input validation
+        console.log('Classifying productivity potential...', score);
+        if (typeof score !== 'number' || score < 0 || score > 1 || Number.isNaN(score)) {
+            throw new Error('Productivity score must be a number between 0 and 1');
+        }
+
+        // Classification thresholds based on agricultural productivity standards
+        const PRODUCTIVITY_CLASSES = Object.freeze({
+            EXCEPTIONAL: {
+                threshold: 0.85,
+                name: 'Exceptional Productivity',
+                confidence: 0.95,
+                yieldPotential: '> 90%',
+                managementLevel: 'Minimal'
+            },
+            HIGH: {
+                threshold: 0.70,
+                name: 'High Productivity',
+                confidence: 0.85,
+                yieldPotential: '75-90%',
+                managementLevel: 'Low'
+            },
+            MODERATE: {
+                threshold: 0.50,
+                name: 'Moderate Productivity',
+                confidence: 0.75,
+                yieldPotential: '50-75%',
+                managementLevel: 'Medium'
+            },
+            LOW: {
+                threshold: 0.30,
+                name: 'Low Productivity',
+                confidence: 0.65,
+                yieldPotential: '25-50%',
+                managementLevel: 'High'
+            },
+            MARGINAL: {
+                threshold: 0.00,
+                name: 'Marginal Productivity',
+                confidence: 0.80,
+                yieldPotential: '< 25%',
+                managementLevel: 'Intensive'
+            }
+        });
+
+        // Find appropriate classification using early return
+        for (const [className, data] of Object.entries(PRODUCTIVITY_CLASSES)) {
+            if (score >= data.threshold) {
+                return {
+                    class: className,
+                    name: data.name,
+                    score,
+                    confidence: data.confidence,
+                    yieldPotential: data.yieldPotential,
+                    managementLevel: data.managementLevel,
+                    improvementPotential: this.calculateImprovementPotential(score, data.threshold),
+                    constraints: this.identifyProductivityConstraints(score, data.threshold),
+                    recommendations: this.getProductivityRecommendations(className, score)
+                };
+            }
+        }
+
+        // Fallback classification (should never reach here due to threshold structure)
+        const marginalClass = PRODUCTIVITY_CLASSES.MARGINAL;
+        return {
+            class: 'MARGINAL',
+            name: marginalClass.name,
+            score,
+            confidence: marginalClass.confidence,
+            yieldPotential: marginalClass.yieldPotential,
+            managementLevel: marginalClass.managementLevel,
+            improvementPotential: this.calculateImprovementPotential(score, 0),
+            constraints: this.identifyProductivityConstraints(score, 0),
+            recommendations: this.getProductivityRecommendations('MARGINAL', score)
+        };
+    }
+
+    /**
+     * Calculate potential for productivity improvement
+     * @private
+     * @param {number} score - Current productivity score
+     * @param {number} threshold - Classification threshold
+     * @returns {Object} Improvement potential metrics
+     */
+    static calculateImprovementPotential(score, threshold) {
+        const potentialGain = Math.max(0, (1 - score));
+        const feasibility = score >= threshold ? 'High' : 'Moderate';
+
+        return {
+            potentialGain: Number(potentialGain.toFixed(2)),
+            feasibility,
+            timeframe: potentialGain > 0.3 ? 'Long-term' : 'Short-term',
+            roi: potentialGain > 0.5 ? 'High' : 'Moderate'
+        };
+    }
+
+    /**
+     * Identify constraints limiting productivity
+     * @private
+     * @param {number} score - Current productivity score
+     * @param {number} threshold - Classification threshold
+     * @returns {Object[]} Array of identified constraints
+     */
+    static identifyProductivityConstraints(score, threshold) {
+        const constraints = [];
+        const gap = threshold - score;
+
+        if (gap > 0.3) {
+            constraints.push({
+                type: 'Structural',
+                severity: 'High',
+                impact: 'Significant yield reduction',
+                mitigationComplexity: 'Complex'
+            });
+        }
+
+        if (gap > 0.1) {
+            constraints.push({
+                type: 'Management',
+                severity: 'Moderate',
+                impact: 'Reduced efficiency',
+                mitigationComplexity: 'Moderate'
+            });
+        }
+
+        return constraints;
+    }
+
+    /**
+     * Generate productivity-specific recommendations
+     * @private
+     * @param {string} className - Productivity class identifier
+     * @param {number} score - Productivity score
+     * @returns {Object[]} Array of targeted recommendations
+     */
+    static getProductivityRecommendations(className, score) {
+        const recommendations = [];
+
+        switch (className) {
+            case 'EXCEPTIONAL':
+                recommendations.push({
+                    focus: 'Maintenance',
+                    priority: 'High',
+                    action: 'Maintain current management practices',
+                    timeframe: 'Ongoing'
+                });
+                break;
+            case 'HIGH':
+                recommendations.push({
+                    focus: 'Optimization',
+                    priority: 'Medium',
+                    action: 'Fine-tune management practices',
+                    timeframe: 'Quarterly'
+                });
+                break;
+            case 'MODERATE':
+                recommendations.push({
+                    focus: 'Enhancement',
+                    priority: 'High',
+                    action: 'Implement targeted improvements',
+                    timeframe: 'Monthly'
+                });
+                break;
+            case 'LOW':
+                recommendations.push({
+                    focus: 'Rehabilitation',
+                    priority: 'Urgent',
+                    action: 'Major management changes required',
+                    timeframe: 'Immediate'
+                });
+                break;
+            case 'MARGINAL':
+                recommendations.push({
+                    focus: 'Evaluation',
+                    priority: 'Critical',
+                    action: 'Reassess land use options',
+                    timeframe: 'Immediate'
+                });
+                break;
         }
 
         return recommendations;
