@@ -878,7 +878,6 @@ class AgriculturalLandAnalyzer {
      */
     static analyzeDrainage(elevationSurface) {
         const flowAccumulation = this.calculateFlowAccumulation(elevationSurface);
-        console.log('flowAccumulation -> ', flowAccumulation)
         return {
             drainagePattern: this.classifyDrainagePattern(flowAccumulation),
             drainageDensity: this.calculateDrainageDensity(flowAccumulation),
@@ -895,7 +894,6 @@ class AgriculturalLandAnalyzer {
         // Simplified D8 flow algorithm
         console.log('Calculating flow accumulation...');
         const cells = this.convertToGrid(elevationSurface);
-        console.log('cells -> ', cells);
         logger.info(cells);
         return this.d8FlowAccumulation(cells);
     }
@@ -1625,7 +1623,7 @@ class AgriculturalLandAnalyzer {
         const score = baseScore *
             adjustments.drainage *
             adjustments.erosion *
-            (1 + adjustments.solar);
+            (adjustments.solar); // refactored this ensure a 0 - 1 range
 
         return {
             score,

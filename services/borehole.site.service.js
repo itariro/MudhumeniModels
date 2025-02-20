@@ -47,24 +47,25 @@ class BoreholeSiteService {
             const { potentialMap, precipitationAnalysis } = await this.calculateGroundwaterPotential(area);
 
             // Perform elevation analysis
-            const elevationAnalysis = await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
-            console.log('elevationAnalysis -> ', JSON.stringify(elevationAnalysis, null, 2));
+            const fieldPotentialAnalysis = await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
+            console.log('elevationAnalysis -> ', JSON.stringify(fieldPotentialAnalysis, null, 2));
 
             // Estimate borehole depth
-            const depthEstimate = await this.estimateBoreholeDepth(area, precipitationAnalysis);
+            const boreholeDepthAnalysis = await this.estimateBoreholeDepth(area, precipitationAnalysis);
 
             // Calculate success probability
             logger.info('Calculating success probability...');
-            const probability = await this.calculateSuccessProbability(
+            const boreholeSucessAnalysis = this.calculateSuccessProbability(
                 { area }, [], precipitationAnalysis
             );
 
             // Return final response
             return {
-                probability,
+                probability: boreholeSucessAnalysis,
                 potentialMap,
                 precipitationAnalysis,
-                depthEstimate,
+                depthEstimate: boreholeDepthAnalysis,
+                elevationAnalysis: fieldPotentialAnalysis
             };
         } catch (error) {
             logger.error('Error in identifyLocations:', error);
@@ -157,64 +158,6 @@ class BoreholeSiteService {
             },
             limitations: this.identifyDepthLimitations(depthRanges),
         };
-    }
-
-    /**
-     * Analyzes precipitation data for a given latitude and longitude over the past 5 years.
-     *
-     * @param {number} lat - The latitude of the location to analyze.
-     * @param {number} lon - The longitude of the location to analyze.
-     * @returns {Promise<Object>} A promise that resolves to an object containing advanced precipitation metrics.
-     * @throws {Error} If there is an error fetching the precipitation data.
-     */
-    static async analyzePrecipitationDeprecated(lat, lon) {
-        const end = Math.floor(Date.now() / 1000);
-        const start = end - 5 * 365 * 24 * 60 * 60; // 5 years in seconds
-
-        try {
-            const response = require('../data/precipitation_data_5_years.json');
-            return this.calculateAdvancedPrecipitationMetrics(response);
-        } catch (error) {
-            logger.error('Error fetching precipitation data:', error);
-            throw new Error('Precipitation data fetch failed.');
-        }
-    }
-
-    /**
-     * Analyzes precipitation data for a given latitude and longitude, and returns advanced precipitation metrics.
-     *
-     * @param {number} lat - The latitude of the location to analyze.
-     * @param {number} lon - The longitude of the location to analyze.
-     * @returns {Promise<Object>} - An object containing advanced precipitation metrics, including annual metrics, monthly averages, seasonal patterns, extreme events, trends, recharge patterns, and reliability scores.
-     * @throws {Error} - If the precipitation data fetch fails.
-     */
-    static async analyzePrecipitationReal(lat, lon) {
-
-        const end = Math.floor(Date.now() / 1000); // UNIX timestamp in seconds
-        const start = end - 5 * 365 * 24 * 60 * 60; // 5 years ago in UNIX timestamp seconds
-
-        try {
-            const url = `${OPENWEATHER_URL}lat=${lat}&lon=${lon}&type=hour&&start=${start}&end=${end}&appid=${OPENWEATHER_API_KEY}`;
-            const response = await axios.get(url);
-
-            if (!response.data || !Array.isArray(response.data)) {
-                throw new Error('Invalid precipitation data format');
-            }
-
-            return this.calculateAdvancedPrecipitationMetrics(response.data);
-        } catch (error) {
-            logger.error('Error fetching precipitation data:', error);
-
-            // Fallback to local data for development/testing
-            try {
-                const localData = require('../data/precipitation_data_5_years.json');
-                logger.warn('Using local precipitation data as fallback');
-                return this.calculateAdvancedPrecipitationMetrics(localData);
-            } catch (localError) {
-                logger.error('Error loading local precipitation data:', localError);
-                throw new Error('Precipitation data fetch failed');
-            }
-        }
     }
 
     static async analyzePrecipitation(lat, lon) {
@@ -985,7 +928,6 @@ class BoreholeSiteService {
         const url = `https://www.gmrt.org:443/services/PointServer?longitude=${lon}&latitude=${lat}&format=json`;
         try {
             const response = await axios.get(url);
-            console.log('fetchElevationData -> ', response.data)
             return response.data; // Contains elevation data
         } catch (error) {
             logger.error('Error fetching elevation data from OpenTopography:', error);
@@ -1068,51 +1010,14 @@ class BoreholeSiteService {
             };
         }
     }
+    
     /**
-         * Fetch lithological data from GLiM dataset (example integration).
-         */
-    // static async fetchLithologicalData(lat, lon) {
-    //     // Using OneGeology WMS service for lithological data
-    //     const wmsUrl = `https://onegeology.brgm.fr/geoserver/wms?service=WMS&version=1.3.0&request=GetMap&layers=onegeology:glim_litho&bbox=${lon - 0.1},${lat - 0.1},${lon + 0.1},${lat + 0.1}&width=256&height=256&format=image/geotiff`;
-
-    //     try {
-    //         logger.info('Fetching lithological data for coordinates:', { lat, lon });
-    //         const response = await axios.get(wmsUrl, {
-    //             responseType: 'arraybuffer',
-    //             headers: {
-    //                 'Accept': 'image/geotiff'
-    //             }
-    //         });
-
-    //         // Parse GeoTIFF using geotiff.js
-    //         const tiff = await GeoTIFF.fromArrayBuffer(response.data);
-    //         const image = await tiff.getImage();
-    //         const rasters = await image.readRasters();
-
-    //         // Get lithological classification from pixel values
-    //         const lithologyData = [];
-    //         const width = image.getWidth();
-    //         const height = image.getHeight();
-
-    //         for (let i = 0; i < width * height; i++) {
-    //             const pixelValue = rasters[0][i];
-    //             // Map pixel values to lithology types based on GLiM classification
-    //             const lithologyType = this.mapPixelValueToLithology(pixelValue);
-    //             if (lithologyType) {
-    //                 lithologyData.push({
-    //                     type: lithologyType.type,
-    //                     coverage: lithologyType.coverage
-    //                 });
-    //             }
-    //         }
-
-    //         return lithologyData;
-    //     } catch (error) {
-    //         logger.error('Error fetching and processing lithological data:', error);
-    //         throw new Error('Failed to fetch and process lithological data.');
-    //     }
-    // }
-
+     * Maps a pixel value to a lithological type and coverage.
+     * The mapping is based on the GLiM (Global Lithological Map) classification.
+     *
+     * @param {number} pixelValue - The pixel value to be mapped to a lithological type.
+     * @returns {Object|null} - An object with the lithological type and coverage, or null if the pixel value is not found in the mapping.
+     */
     static mapPixelValueToLithology(pixelValue) {
         // GLiM classification mapping
         const lithologyMap = {
@@ -1192,15 +1097,10 @@ class BoreholeSiteService {
             }
         };
 
-        console.log('lithologicalData -> ', lithologicalData);
-
         if (lithologicalData.success) {
             lithologicalData.data.forEach(formation => {
-                console.log('formation -> ', formation.type);
             });
         }
-
-
 
         const totalScore = await lithologicalData.data.reduce(async (sumPromise, formation) => {
             const sum = await sumPromise;
@@ -1294,7 +1194,10 @@ class BoreholeSiteService {
     }
 
     /**
-     * Calculate the fracture zone score.
+     * Calculates the fracture zone score based on the provided geological features.
+     * The score is proportional to the number of fracture formations relative to the total number of geological features.
+     * @param {Object[]} geologicalFeatures - An array of geological feature objects.
+     * @returns {number} The fracture zone score, ranging from 0 to 1.
      */
     static calculateFractureZoneScore(geologicalFeatures) {
         const fractureFormations = geologicalFeatures.filter(formation =>
@@ -1309,8 +1212,13 @@ class BoreholeSiteService {
         return Math.min(fractureFormations.length / geologicalFeatures.length, 1);
     }
 
+    
     /**
-     * Calculate the elevation score.
+     * Calculates the elevation score based on the provided elevation data.
+     * The score is normalized to a range of 0 to 1, where 0 represents the highest elevation and 1 represents the lowest elevation.
+     * The score is calculated as 1 - (average elevation / 1000), assuming 1000m as the upper limit.
+     * @param {Object|Object[]} elevationData - The elevation data, which can be a single object or an array of objects with an 'elevation' property.
+     * @returns {number} The elevation score, ranging from 0 to 1.
      */
     static calculateElevationScore(elevationData) {
         if (Array.isArray(elevationData)) {
