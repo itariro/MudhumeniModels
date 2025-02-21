@@ -29,6 +29,7 @@ const logger = winston.createLogger({
 });
 
 class BoreholeSiteService {
+    static FIELD_SLOPE = 0
     static async identifyLocations(polygon) {
         try {
             // Validate polygon structure
@@ -43,12 +44,12 @@ class BoreholeSiteService {
             // Create an Earth Engine polygon
             const area = ee.Geometry.Polygon(polygon.geometry.coordinates);
 
-            // Perform groundwater potential analysis
-            const { potentialMap, precipitationAnalysis } = await this.calculateGroundwaterPotential(area);
-
-            // Perform elevation analysis
+            // Perform field potential analysis
             const fieldPotentialAnalysis = await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
             console.log('elevationAnalysis -> ', JSON.stringify(fieldPotentialAnalysis, null, 2));
+
+            // Perform groundwater potential analysis
+            const { potentialMap, precipitationAnalysis } = await this.calculateGroundwaterPotential(area);
 
             // Estimate borehole depth
             const boreholeDepthAnalysis = await this.estimateBoreholeDepth(area, precipitationAnalysis);
@@ -61,11 +62,11 @@ class BoreholeSiteService {
 
             // Return final response
             return {
-                probability: boreholeSucessAnalysis,
+                boreholeSucessAnalysis,
                 potentialMap,
                 precipitationAnalysis,
-                depthEstimate: boreholeDepthAnalysis,
-                elevationAnalysis: fieldPotentialAnalysis
+                boreholeDepthAnalysis,
+                fieldPotentialAnalysis
             };
         } catch (error) {
             logger.error('Error in identifyLocations:', error);
@@ -78,9 +79,7 @@ class BoreholeSiteService {
         const [lon, lat] = center;
 
         logger.info('Center coordinates:', { lon, lat });
-        const precipitationAnalysis = await this.analyzePrecipitation(lat, lon);
-        logger.info('precipitationAnalysis:', { precipitationAnalysis });
-
+        
         // Batch Earth Engine API calls for efficiency
         const elevation = ee.Image('USGS/SRTMGL1_003');
         const landcover = ee.ImageCollection('MODIS/006/MCD12Q1').first();
@@ -90,8 +89,12 @@ class BoreholeSiteService {
         logger.info('Earth Engine data loaded:', { elevation, landcover, soilMoisture, temperature });
 
         const bbox = polygon.bounds().getInfo().coordinates[0];
-        const weights = this.calculateDynamicWeights(precipitationAnalysis);
         const slope = ee.Terrain.slope(elevation);
+        this.FIELD_SLOPE = slope;
+        
+        logger.info('precipitationAnalysis:', { precipitationAnalysis });
+        const precipitationAnalysis = await this.analyzePrecipitation(lat, lon);
+        const weights = this.calculateDynamicWeights(precipitationAnalysis);
 
         logger.info('Calculating weights and slope:', { weights, slope });
 
@@ -167,7 +170,7 @@ class BoreholeSiteService {
                 "longitude": lon,
                 "start_date": new Date(Date.now() - 5 * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
                 "end_date": new Date().toISOString().split('T')[0],
-                "hourly": ["temperature_2m", "rain", "precipitation"],
+                "hourly": ["temperature_2m", "rain", "soil_moisture_0_to_1cm"],
                 "timezone": "GMT"
             };
 
@@ -190,15 +193,21 @@ class BoreholeSiteService {
             const formattedData = [];
             const times = range(Number(hourly.time()), Number(hourly.timeEnd()), hourly.interval());
             const rain = hourly.variables(1).valuesArray();
+            const soilMoisture = hourly.variables(2).valuesArray();
 
             if (!rain || rain.length === 0) {
                 throw new Error('No rain data available in the response');
+            }
+
+            if (!soilMoisture || soilMoisture.length === 0) {
+                throw new Error('No soil moisture data available in the response');
             }
 
             for (let i = 0; i < times.length; i++) {
                 formattedData.push({
                     dt: Math.floor(times[i]).toString(),
                     rain: parseFloat(rain[i].toFixed(2)),
+                    soilMoisture: parseFloat(soilMoisture[i].toFixed(2)),
                     count: Math.floor(Math.random() * 30) + 1  // Sample count between 1-30
                 });
             }
@@ -237,16 +246,13 @@ class BoreholeSiteService {
         };
 
         const groupedData = this.groupPrecipitationData(precipData);
-
         metrics.annualMetrics = this.calculateAnnualMetrics(groupedData);
         const seasonalResults = this.analyzeSeasonalPatterns(groupedData);
         metrics.monthlyAverages = seasonalResults.monthlyAverages;
         metrics.seasonalPatterns = seasonalResults.seasonalPatterns;
-
         metrics.extremeEvents = this.identifyExtremeEvents(precipData, metrics.monthlyAverages);
         metrics.trends = this.analyzePrecipitationTrends(groupedData);
         metrics.rechargePatterns = this.analyzeRechargePatterns(precipData, metrics.monthlyAverages);
-
         metrics.reliabilityScores = this.calculateReliabilityScores(metrics);
 
         return metrics;
@@ -402,6 +408,13 @@ class BoreholeSiteService {
         return events;
     }
 
+    /**
+     * Calculates the severity of a drought based on the ratio of rainfall to the monthly average.
+     *
+     * @param {number} rainfall - The amount of rainfall.
+     * @param {number} monthlyAverage - The monthly average rainfall.
+     * @returns {number} - The drought severity, ranging from 0 (not a drought) to 1 (severe drought).
+     */
     static calculateDroughtSeverity(rainfall, monthlyAverage) {
         if (monthlyAverage === 0) return 1; // Maximum severity if no rain is expected
 
@@ -412,6 +425,12 @@ class BoreholeSiteService {
         return 1; // Severe drought
     }
 
+    /**
+     * Analyzes the precipitation trends in the provided grouped precipitation data.
+     *
+     * @param {Object} groupedData - An object where the keys are years and the values are arrays of monthly precipitation totals.
+     * @returns {Object} - An object containing the long-term trend, year-over-year changes, and precipitation cycle analysis.
+     */
     static analyzePrecipitationTrends(groupedData) {
         const yearlyTotals = Object.entries(groupedData).map(([year, months]) => ({
             year: parseInt(year),
@@ -427,6 +446,12 @@ class BoreholeSiteService {
         };
     }
 
+    /**
+     * Calculates the year-over-year changes in precipitation totals.
+     *
+     * @param {Object[]} yearlyTotals - An array of objects, where each object represents a year and has `year` and `total` properties.
+     * @returns {Object[]} - An array of objects, where each object represents a year and has `year`, `change`, and `percentageChange` properties.
+     */
     static calculateYearOverYearChanges(yearlyTotals) {
         if (!yearlyTotals || yearlyTotals.length < 2) {
             return [];
@@ -447,6 +472,12 @@ class BoreholeSiteService {
         return changes;
     }
 
+    /**
+     * Analyzes the precipitation cycles in the provided yearly precipitation data.
+     *
+     * @param {Object[]} yearlyTotals - An array of objects, where each object represents a year and has `year` and `total` properties.
+     * @returns {Object} - An object containing the identified precipitation cycle peaks, troughs, and the average cycle length.
+     */
     static analyzePrecipitationCycles(yearlyTotals) {
         if (!yearlyTotals || yearlyTotals.length < 3) {
             return { peaks: [], troughs: [], averageCycleLength: null };
@@ -485,44 +516,116 @@ class BoreholeSiteService {
         return { peaks, troughs, averageCycleLength };
     }
 
-    static analyzeRechargePatterns(precipData, monthlyAverages) {
-        const rechargeThreshold = this.calculateRechargeThreshold(monthlyAverages);
+    /**
+     * Analyzes the recharge patterns for a borehole site based on precipitation data, monthly averages, soil moisture, and slope.
+     *
+     * @param {Array<{dt: number, rain: number}>} precipData - An array of precipitation data records, where each record has `dt` (timestamp) and `rain` (precipitation amount) properties.
+     * @param {Object.<string, number>} monthlyAverages - An object with monthly precipitation averages, where the keys are month names and the values are the average precipitation for that month.
+     * @param {number} [soilMoisture=0.5] - The soil moisture level, ranging from 0 to 1.
+     * @param {number} [slope=5] - The slope of the borehole site, in degrees.
+     * @returns {Promise<{
+     *   potentialRechargeEvents: {date: Date, amount: number}[],
+     *   annualRechargePattern: {[year: number]: number},
+     *   rechargeEfficiency: number,
+     *   error?: string
+     * }>} - An object containing the analyzed recharge patterns, including potential recharge events, annual recharge pattern, and recharge efficiency.  Includes an error property if an error occurs.
+     * @example
+     * const precipData = [{dt: 1678886400, rain: 10}, {dt: 1678972800, rain: 15}];
+     * const monthlyAverages = {"0": 12, "1": 15};
+     * analyzeRechargePatterns(precipData, monthlyAverages, 0.6, 8).then(console.log);
+     */
+    static async analyzeRechargePatterns(precipData, monthlyAverages) {
+        try {
+            if (!Array.isArray(precipData) || !monthlyAverages || typeof monthlyAverages !== 'object') {
+                throw new Error('Invalid input parameters');
+            }
 
-        return {
-            potentialRechargeEvents: this.identifyRechargeEvents(precipData, rechargeThreshold),
-            annualRechargePattern: this.calculateAnnualRechargePattern(precipData, rechargeThreshold),
-            rechargeEfficiency: this.calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold),
-        };
+            const rechargeThreshold = this.calculateRechargeThreshold(monthlyAverages);
+            const [events, annualPattern, efficiency] = await Promise.all([
+                this.identifyRechargeEvents(precipData, rechargeThreshold, this.FIELD_SLOPE),
+                this.calculateAnnualRechargePattern(precipData, rechargeThreshold),
+                this.calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold)
+            ]);
+
+            return {
+                potentialRechargeEvents: events,
+                annualRechargePattern,
+                rechargeEfficiency: efficiency
+            };
+        } catch (error) {
+            logger.error('Error analyzing recharge patterns:', error);
+            return {
+                potentialRechargeEvents: [],
+                annualRechargePattern: {},
+                rechargeEfficiency: 0,
+                error: error.message
+            };
+        }
     }
 
+    /**
+     * Calculate recharge threshold using dynamic statistical methods.
+     * @param {Object.<string, number>} monthlyAverages - Monthly average rainfall data.
+     * @returns {number} - The calculated recharge threshold.
+     * @example
+     * calculateRechargeThreshold({"0": 10, "1": 12}) // Returns a number
+     */
     static calculateRechargeThreshold(monthlyAverages) {
-        const monthlyRainfall = Object.values(monthlyAverages).flat();
+        const monthlyRainfall = Object.values(monthlyAverages);
         const avg = this.average(monthlyRainfall);
         const stdDev = Math.sqrt(monthlyRainfall.reduce((sum, val) => sum + Math.pow(val - avg, 2), 0) / monthlyRainfall.length);
-        return avg + stdDev;
+        return avg + (stdDev * 1.5); // Adjust multiplier based on local conditions
     }
 
-    static identifyRechargeEvents(precipData, rechargeThreshold) {
-        const rechargeEvents = [];
-        precipData.forEach(record => {
-            if (record.rain > rechargeThreshold) {
-                rechargeEvents.push({ date: new Date(record.dt * 1000), amount: record.rain });
-            }
-        });
-        return rechargeEvents;
+    /**
+     * Identify recharge events with additional factors like soil moisture and slope.
+     * @param {Array<{dt: number, rain: number}>} precipData - Precipitation data array.
+     * @param {number} rechargeThreshold - Calculated recharge threshold.
+     * @param {number} soilMoisture - Soil moisture value (0-1).
+     * @param {number} slope - Slope value (degrees).
+     * @returns {Array<{date: Date, amount: number}>} - Array of recharge events.
+     * @example
+     * identifyRechargeEvents([{dt: 1623456789, rain: 25}], 20, 0.6, 8)
+     * // Returns: [{date: Date, amount: 25}]
+     */
+    static identifyRechargeEvents(precipData, rechargeThreshold, slope) {
+        return precipData.filter(record => {
+            const soilFactor = record.soilMoisture > RechargeConstants.SOIL_MOISTURE_THRESHOLD ? RechargeConstants.SOIL_FACTOR_HIGH : RechargeConstants.SOIL_FACTOR_LOW;
+            const slopeFactor = slope < RechargeConstants.SLOPE_THRESHOLD ? RechargeConstants.SLOPE_FACTOR_LOW : RechargeConstants.SLOPE_FACTOR_HIGH;
+            return record.rain > (rechargeThreshold * soilFactor * slopeFactor);
+        }).map(record => ({
+            date: new Date(record.dt * 1000),
+            amount: record.rain
+        }));
     }
 
+    /**
+     * @param {Array<{dt: number, rain: number}>} precipData - Precipitation data array
+     * @param {number} rechargeThreshold - Calculated recharge threshold
+     * @returns {Object.<number, number>} - Yearly recharge totals
+     * @example
+     * calculateAnnualRechargePattern([{dt: 1623456789, rain: 25}], 20)
+     * // Returns: {2021: 25}
+     */
     static calculateAnnualRechargePattern(precipData, rechargeThreshold) {
-        const yearlyRecharge = {};
-        precipData.forEach(record => {
+        return precipData.reduce((yearlyRecharge, record) => {
             if (record.rain > rechargeThreshold) {
                 const year = new Date(record.dt * 1000).getFullYear();
                 yearlyRecharge[year] = (yearlyRecharge[year] || 0) + record.rain;
             }
-        });
-        return yearlyRecharge;
+            return yearlyRecharge;
+        }, {});
     }
 
+    /**
+     * Calculates recharge efficiency.
+     * @param {Array<{dt: number, rain: number}>} precipData - Precipitation data.
+     * @param {Object.<string, number>} monthlyAverages - Monthly precipitation averages.
+     * @param {number} rechargeThreshold - Recharge threshold.
+     * @returns {number} Recharge efficiency (0-1).
+     * @example
+     * calculateRechargeEfficiency([{dt: 123, rain: 15}], {'0': 10}, 12)
+     */
     static calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold) {
         let totalRecharge = 0;
         let totalRainfall = 0;
@@ -855,7 +958,7 @@ class BoreholeSiteService {
         try {
             // Fetch geological data from APIs
             const geologicalFormations = await this.fetchGeologicalFormations(lat, lon);
-            const elevationData = await this.fetchElevationData(lat, lon);
+            const elevationData = await AgriculturalLandAnalyzer.fetchSinglePointElevation(lat, lon);
             const geologicalFeatures = await this.fetchGeologicalFeatures(lat, lon);
             const lithologicalData = await this.fetchLithologicalData(lat, lon);
 
@@ -913,25 +1016,6 @@ class BoreholeSiteService {
         } catch (error) {
             logger.error('Error fetching geological data from USGS:', error);
             throw new Error('Failed to fetch geological data.');
-        }
-    }
-
-
-    /**
-     * Fetch elevation data for the given latitude and longitude coordinates.
-     *
-     * @param {number} lat - The latitude coordinate.
-     * @param {number} lon - The longitude coordinate.
-     * @returns {Promise<Object>} - The elevation data for the specified coordinates.
-     */
-    static async fetchElevationData(lat, lon) {
-        const url = `https://www.gmrt.org:443/services/PointServer?longitude=${lon}&latitude=${lat}&format=json`;
-        try {
-            const response = await axios.get(url);
-            return response.data; // Contains elevation data
-        } catch (error) {
-            logger.error('Error fetching elevation data from OpenTopography:', error);
-            throw new Error('Failed to fetch elevation data.');
         }
     }
 
@@ -1010,7 +1094,7 @@ class BoreholeSiteService {
             };
         }
     }
-    
+
     /**
      * Maps a pixel value to a lithological type and coverage.
      * The mapping is based on the GLiM (Global Lithological Map) classification.
@@ -1212,7 +1296,7 @@ class BoreholeSiteService {
         return Math.min(fractureFormations.length / geologicalFeatures.length, 1);
     }
 
-    
+
     /**
      * Calculates the elevation score based on the provided elevation data.
      * The score is normalized to a range of 0 to 1, where 0 represents the highest elevation and 1 represents the lowest elevation.
