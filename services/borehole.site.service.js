@@ -28,6 +28,23 @@ const logger = winston.createLogger({
     ]
 });
 
+class RechargeConstants {
+    // Soil moisture thresholds based on USDA soil classification
+    static SOIL_MOISTURE_THRESHOLD = 0.35; // Field capacity threshold for most agricultural soils
+    static SOIL_FACTOR_HIGH = 1.5;  // Higher recharge potential above field capacity
+    static SOIL_FACTOR_LOW = 0.6;   // Lower recharge potential in dry conditions
+
+    // Slope thresholds based on FAO land classification
+    static SLOPE_THRESHOLD = 15;     // 15 degrees (approximately 27% slope)
+    static SLOPE_FACTOR_HIGH = 0.4;  // Steep slopes reduce recharge significantly
+    static SLOPE_FACTOR_LOW = 1.2;   // Gentle slopes favor groundwater recharge
+
+    // Additional real-world factors
+    static MIN_ANNUAL_RAINFALL = 250;  // Minimum annual rainfall in mm for viable recharge
+    static BEDROCK_DEPTH_MIN = 30;     // Minimum depth to bedrock in meters
+    static INFILTRATION_RATE_MIN = 15; // Minimum infiltration rate in mm/hour
+}
+
 class BoreholeSiteService {
     static FIELD_SLOPE = 0
     static async identifyLocations(polygon) {
@@ -45,8 +62,7 @@ class BoreholeSiteService {
             const area = ee.Geometry.Polygon(polygon.geometry.coordinates);
 
             // Perform field potential analysis
-            const fieldPotentialAnalysis = await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
-            console.log('elevationAnalysis -> ', JSON.stringify(fieldPotentialAnalysis, null, 2));
+            const fieldPotentialAnalysis = []; // await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
 
             // Perform groundwater potential analysis
             const { potentialMap, precipitationAnalysis } = await this.calculateGroundwaterPotential(area);
@@ -79,7 +95,7 @@ class BoreholeSiteService {
         const [lon, lat] = center;
 
         logger.info('Center coordinates:', { lon, lat });
-        
+
         // Batch Earth Engine API calls for efficiency
         const elevation = ee.Image('USGS/SRTMGL1_003');
         const landcover = ee.ImageCollection('MODIS/006/MCD12Q1').first();
@@ -91,8 +107,7 @@ class BoreholeSiteService {
         const bbox = polygon.bounds().getInfo().coordinates[0];
         const slope = ee.Terrain.slope(elevation);
         this.FIELD_SLOPE = slope;
-        
-        logger.info('precipitationAnalysis:', { precipitationAnalysis });
+
         const precipitationAnalysis = await this.analyzePrecipitation(lat, lon);
         const weights = this.calculateDynamicWeights(precipitationAnalysis);
 
@@ -163,99 +178,135 @@ class BoreholeSiteService {
         };
     }
 
+    // Move helper function outside
+    static range(start, stop, step) {
+        return Array.from(
+            { length: Math.ceil((stop - start) / step) },
+            (_, i) => start + i * step
+        );
+    }
+
     static async analyzePrecipitation(lat, lon) {
         try {
+            const startDate = new Date();
+            startDate.setFullYear(startDate.getFullYear() - 5);
+
             const params = {
-                "latitude": lat,
-                "longitude": lon,
-                "start_date": new Date(Date.now() - 5 * 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-                "end_date": new Date().toISOString().split('T')[0],
-                "hourly": ["temperature_2m", "rain", "soil_moisture_0_to_1cm"],
-                "timezone": "GMT"
+                latitude: lat,
+                longitude: lon,
+                start_date: startDate.toISOString().split('T')[0],
+                end_date: new Date().toISOString().split('T')[0],
+                hourly: ["temperature_2m", "rain", "soil_moisture_100_to_255cm"],
+                timezone: "GMT"
             };
 
             logger.info(`Fetching historical precipitation data for lat: ${lat}, lon: ${lon}`);
-            const url = "https://archive-api.open-meteo.com/v1/archive";
-            const responses = await openmeteo.fetchWeatherApi(url, params);
 
-            if (!responses || responses.length === 0) {
-                throw new Error('No response received from Open-Meteo API');
+            const url = "https://archive-api.open-meteo.com/v1/archive";
+            const response = await fetch(url + '?' + new URLSearchParams(params));
+
+            if (!response.ok) {
+                throw new Error(`API request failed with status ${response.status}`);
             }
 
-            const response = responses[0];
-            const utcOffsetSeconds = response.utcOffsetSeconds();
-            const hourly = response.hourly();
+            const data = await response.json();
+            logger.info(`Fetching historical precipitation data`);
 
-            if (!hourly) {
+            if (!data.hourly) {
                 throw new Error('No hourly data available in the response');
             }
 
-            const formattedData = [];
-            const times = range(Number(hourly.time()), Number(hourly.timeEnd()), hourly.interval());
-            const rain = hourly.variables(1).valuesArray();
-            const soilMoisture = hourly.variables(2).valuesArray();
+            const { time, rain, soil_moisture_100_to_255cm } = data.hourly;
 
-            if (!rain || rain.length === 0) {
-                throw new Error('No rain data available in the response');
+            if (!time?.length || !rain?.length || !soil_moisture_100_to_255cm?.length) {
+                throw new Error('Missing required weather data in response');
             }
 
-            if (!soilMoisture || soilMoisture.length === 0) {
-                throw new Error('No soil moisture data available in the response');
-            }
-
-            for (let i = 0; i < times.length; i++) {
-                formattedData.push({
-                    dt: Math.floor(times[i]).toString(),
-                    rain: parseFloat(rain[i].toFixed(2)),
-                    soilMoisture: parseFloat(soilMoisture[i].toFixed(2)),
-                    count: Math.floor(Math.random() * 30) + 1  // Sample count between 1-30
-                });
-            }
+            const formattedData = time.map((timestamp, i) => {
+                // Handle null or undefined values
+                const rainValue = rain[i] !== null && rain[i] !== undefined ? Number(rain[i].toFixed(2)) : 0;
+                const soilMoistureValue = soil_moisture_100_to_255cm[i] !== null && soil_moisture_100_to_255cm[i] !== undefined
+                    ? Number(soil_moisture_100_to_255cm[i].toFixed(2))
+                    : 0;
+                return {
+                    dt: new Date(timestamp).getTime(),
+                    rain: rainValue,
+                    soilMoisture: soilMoistureValue
+                };
+            });
 
             logger.info(`Successfully processed ${formattedData.length} precipitation records`);
             return this.calculateAdvancedPrecipitationMetrics(formattedData);
 
         } catch (error) {
-            logger.error('Error in fetchHistoricalPrecipitation:', error);
+            logger.error('Error in analyzePrecipitation:', error);
             throw new Error(`Failed to fetch historical precipitation data: ${error.message}`);
         }
-
-        // Helper function to form time ranges
-        function range(start, stop, step) {
-            return Array.from({ length: (stop - start) / step }, (_, i) => start + i * step);
-        }
     }
+
     /**
      * Calculates advanced precipitation metrics from the provided precipitation data.
      *
      * @param {Object[]} precipData - The precipitation data to analyze.
      * @returns {Object} - An object containing advanced precipitation metrics, including annual metrics, monthly averages, seasonal patterns, extreme events, trends, recharge patterns, and reliability scores.
      */
-    static calculateAdvancedPrecipitationMetrics(precipData) {
-        const metrics = {
-            annualMetrics: [],
-            monthlyAverages: {},
-            seasonalPatterns: {},
-            extremeEvents: {
-                droughts: [],
-                heavyRainfall: [],
-            },
-            trends: {},
-            rechargePatterns: {},
-            reliabilityScores: {},
-        };
+    static async calculateAdvancedPrecipitationMetrics(precipData) {
+        try {
+            //console.log('precipData -> ', precipData);
 
-        const groupedData = this.groupPrecipitationData(precipData);
-        metrics.annualMetrics = this.calculateAnnualMetrics(groupedData);
-        const seasonalResults = this.analyzeSeasonalPatterns(groupedData);
-        metrics.monthlyAverages = seasonalResults.monthlyAverages;
-        metrics.seasonalPatterns = seasonalResults.seasonalPatterns;
-        metrics.extremeEvents = this.identifyExtremeEvents(precipData, metrics.monthlyAverages);
-        metrics.trends = this.analyzePrecipitationTrends(groupedData);
-        metrics.rechargePatterns = this.analyzeRechargePatterns(precipData, metrics.monthlyAverages);
-        metrics.reliabilityScores = this.calculateReliabilityScores(metrics);
+            // Initialize metrics object
+            const metrics = {
+                annualMetrics: [],
+                monthlyAverages: {},
+                seasonalPatterns: {},
+                extremeEvents: {
+                    droughts: [],
+                    heavyRainfall: [],
+                },
+                trends: {},
+                rechargePatterns: {},
+                reliabilityScores: {},
+            };
 
-        return metrics;
+            // Group precipitation data first since other calculations depend on it
+            const groupedData = await Promise.resolve(this.groupPrecipitationData(precipData));
+            //console.log('groupedData -> ', groupedData);
+
+            // Execute all independent calculations concurrently
+            const [
+                annualMetrics,
+                seasonalResults,
+                trends
+            ] = await Promise.all([
+                Promise.resolve(this.calculateAnnualMetrics(groupedData)),
+                Promise.resolve(this.analyzeSeasonalPatterns(groupedData)),
+                Promise.resolve(this.analyzePrecipitationTrends(groupedData))
+            ]);
+
+            // Assign results from parallel operations
+            metrics.annualMetrics = annualMetrics;
+            metrics.monthlyAverages = seasonalResults.monthlyAverages;
+            metrics.seasonalPatterns = seasonalResults.seasonalPatterns;
+            metrics.trends = trends;
+
+            // Execute dependent calculations sequentially
+            metrics.extremeEvents = await Promise.resolve(
+                this.identifyExtremeEvents(precipData, metrics.monthlyAverages)
+            );
+
+            metrics.rechargePatterns = await Promise.resolve(
+                this.analyzeRechargePatterns(precipData, metrics.monthlyAverages)
+            );
+
+            metrics.reliabilityScores = await Promise.resolve(
+                this.calculateReliabilityScores(metrics)
+            );
+
+            return metrics;
+        } catch (error) {
+            console.error('Error calculating precipitation metrics:', error);
+            throw new Error('Failed to calculate precipitation metrics: ' + error.message);
+        }
     }
 
     /**
@@ -266,7 +317,7 @@ class BoreholeSiteService {
      */
     static groupPrecipitationData(precipData) {
         return precipData.reduce((acc, record) => {
-            const date = new Date(record.dt * 1000);
+            const date = new Date(record.dt);
             const year = date.getFullYear();
             const month = date.getMonth();
 
@@ -379,7 +430,7 @@ class BoreholeSiteService {
         let consecutiveDryDays = 0;
 
         precipData.forEach((record, index) => {
-            const date = new Date(record.dt * 1000);
+            const date = new Date(record.dt);
             const month = date.getMonth();
             const monthlyAverage = monthlyAverages[month];
 
@@ -387,7 +438,7 @@ class BoreholeSiteService {
                 consecutiveDryDays++;
                 if (consecutiveDryDays >= 30) {
                     events.droughts.push({
-                        startDate: new Date(precipData[index - 29].dt * 1000),
+                        startDate: new Date(precipData[index - 29].dt),
                         endDate: date,
                         severity: this.calculateDroughtSeverity(record.rain, monthlyAverage),
                     });
@@ -547,9 +598,11 @@ class BoreholeSiteService {
                 this.calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold)
             ]);
 
+            console.log('events -> ', events, 'efficiency -> ', efficiency);
+
             return {
                 potentialRechargeEvents: events,
-                annualRechargePattern,
+                annualRechargePattern: annualPattern,
                 rechargeEfficiency: efficiency
             };
         } catch (error) {
@@ -594,7 +647,7 @@ class BoreholeSiteService {
             const slopeFactor = slope < RechargeConstants.SLOPE_THRESHOLD ? RechargeConstants.SLOPE_FACTOR_LOW : RechargeConstants.SLOPE_FACTOR_HIGH;
             return record.rain > (rechargeThreshold * soilFactor * slopeFactor);
         }).map(record => ({
-            date: new Date(record.dt * 1000),
+            date: new Date(record.dt),
             amount: record.rain
         }));
     }
@@ -610,7 +663,7 @@ class BoreholeSiteService {
     static calculateAnnualRechargePattern(precipData, rechargeThreshold) {
         return precipData.reduce((yearlyRecharge, record) => {
             if (record.rain > rechargeThreshold) {
-                const year = new Date(record.dt * 1000).getFullYear();
+                const year = new Date(record.dt).getFullYear();
                 yearlyRecharge[year] = (yearlyRecharge[year] || 0) + record.rain;
             }
             return yearlyRecharge;
@@ -1049,12 +1102,11 @@ class BoreholeSiteService {
         const macrostratUrl = `https://macrostrat.org/api/v2/geologic_units/map?lat=${lat}&lng=${lon}&format=json&all_units=true`;
         try {
             logger.info('Fetching MacroStrat geological data for coordinates:', { lat, lon });
-            console.info('MacroStrat API URL:', `${macrostratUrl}`);
             const response = await axios.get(macrostratUrl, {
                 timeout: 8000  // 8 second timeout
             });
 
-            console.info('MacroStrat API response:', response.data);
+            logger.info('MacroStrat API response:', response.data);
             if (!response.data.success || !response.data.success.data || response.data.success.data.length === 0) {
                 logger.warn('No MacroStrat geological data found for these coordinates', { lat, lon });
                 return {
@@ -1306,6 +1358,8 @@ class BoreholeSiteService {
      */
     static calculateElevationScore(elevationData) {
         if (Array.isArray(elevationData)) {
+            console.log('elevationData:', elevationData);
+            
             const elevations = elevationData.map(point => parseFloat(point.elevation)).filter(e => !isNaN(e));
             if (elevations.length === 0) return 0;
             const averageElevation = elevations.reduce((sum, e) => sum + e, 0) / elevations.length;
