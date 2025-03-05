@@ -6,6 +6,7 @@ const winston = require('winston'); // Added for structured logging
 const openmeteo = require('openmeteo');
 
 const AgriculturalLandAnalyzer = require('../utils/elevation-analysis');
+const GeospatialAccessibilityAssessment = require('../utils/geospatial-accessibility-analysis');
 
 const OPENTOPOGRAPHY_KEY = process.env.OPENTOPOGRAPHY_KEY;
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
@@ -63,6 +64,13 @@ class BoreholeSiteService {
 
             // Perform field potential analysis
             const fieldPotentialAnalysis = []; // await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
+
+            const center = area.centroid().coordinates().getInfo();
+            const [lon, lat] = center;
+            const geospatialAccessibilityAssessment = new GeospatialAccessibilityAssessment(lat, lon);
+            geospatialAccessibilityAssessment.calculateAccessibility().then(result => {
+                console.log('Comprehensive Accessibility Assessment:', result);
+            });
 
             // Perform groundwater potential analysis
             const { potentialMap, precipitationAnalysis } = await this.calculateGroundwaterPotential(area);
@@ -1359,7 +1367,7 @@ class BoreholeSiteService {
     static calculateElevationScore(elevationData) {
         if (Array.isArray(elevationData)) {
             console.log('elevationData:', elevationData);
-            
+
             const elevations = elevationData.map(point => parseFloat(point.elevation)).filter(e => !isNaN(e));
             if (elevations.length === 0) return 0;
             const averageElevation = elevations.reduce((sum, e) => sum + e, 0) / elevations.length;
