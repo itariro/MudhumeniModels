@@ -68,7 +68,7 @@ class BoreholeSiteService {
             const center = area.centroid().coordinates().getInfo();
             const [lon, lat] = center;
             const geospatialAccessibilityAssessment = new GeospatialAccessibilityAssessment(lat, lon);
-            geospatialAccessibilityAssessment.calculateAccessibility().then(result => {
+            geospatialAccessibilityAssessment.assessAccessibility().then(result => {
                 console.log('Comprehensive Accessibility Assessment:', result);
             });
 

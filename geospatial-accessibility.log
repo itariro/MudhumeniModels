@@ -1,0 +1,40 @@
+{"level":"info","message":"making request to overpass api","timestamp":"2025-03-06T12:17:56.485Z"}
+{"error":"Invalid URL","level":"error","message":"API request failed (undefined)","params":{"data":"[out:json][timeout:30];\n      node[place~\"town|village|hamlet|cities\"](31.316823906173546,-17.85163582220269,31.35461247271742,-17.815663007653708);\n      out body;"},"timestamp":"2025-03-06T12:17:58.578Z"}
+{"error":"Invalid URL","level":"warn","message":"Transport analysis degraded","timestamp":"2025-03-06T12:17:58.578Z"}
+{"error":"Request failed with status code 400","level":"error","message":"API request failed (undefined)","params":{"format":"json"},"timestamp":"2025-03-06T12:17:59.429Z","url":"https://nominatim.openstreetmap.org"}
+{"error":"Request failed with status code 400","level":"error","message":"Country code detection failed","timestamp":"2025-03-06T12:17:59.430Z"}
+{"error":"getaddrinfo ENOTFOUND flood.nasa.gov","level":"error","location":"-17.8336494149282,31.335718189445483","message":"Historical flood risk calculation failed","timestamp":"2025-03-06T12:18:00.749Z"}
+{"level":"info","message":"making request to overpass api","timestamp":"2025-03-06T12:22:57.307Z"}
+{"error":"Invalid URL","level":"error","message":"API request failed (undefined)","params":{"data":"[out:json][timeout:30];\n      node[place~\"town|village|hamlet|cities\"](31.316823906173546,-17.85163582220269,31.35461247271742,-17.815663007653708);\n      out body;"},"timestamp":"2025-03-06T12:22:58.466Z"}
+{"error":"Invalid URL","level":"warn","message":"Transport analysis degraded","timestamp":"2025-03-06T12:22:58.466Z"}
+{"error":"Request failed with status code 400","level":"error","message":"API request failed (undefined)","params":{"format":"json"},"timestamp":"2025-03-06T12:22:59.316Z","url":"https://nominatim.openstreetmap.org"}
+{"error":"Request failed with status code 400","level":"error","message":"Country code detection failed","timestamp":"2025-03-06T12:22:59.316Z"}
+{"error":"getaddrinfo ENOTFOUND flood.nasa.gov","level":"error","location":"-17.8336494149282,31.335718189445483","message":"Historical flood risk calculation failed","timestamp":"2025-03-06T12:23:10.984Z"}
+{"error":"Request failed with status code 429","level":"error","message":"API request failed (overpass)","params":{"data":"[out:json][timeout:25];\n        (\n            way[highway~\"motorway|trunk|primary|secondary|tertiary|unclassified|residential\"]\n                (-17.923581451300652,31.241246780794306,-17.743717378555743,31.43018959809666);\n            node[highway~\"motorway|trunk|primary|secondary|tertiary|unclassified|residential\"]\n                (-17.923581451300652,31.241246780794306,-17.743717378555743,31.43018959809666);\n        );\n        out body 100;\n        >;\n        out skel qt;"},"timestamp":"2025-03-06T12:23:15.766Z","url":"https://overpass-api.de/api/interpreter"}
+{"error":"Request failed with status code 429","level":"error","message":"Road data fetch failed","timestamp":"2025-03-06T12:23:15.767Z"}
+{"error":"Request failed with status code 429","level":"warn","message":"Using cached road data","timestamp":"2025-03-06T12:23:15.767Z"}
+{"level":"info","message":"making request to overpass api","timestamp":"2025-03-06T12:28:30.536Z"}
+{"error":"Request failed with status code 400","level":"error","message":"API request failed (undefined)","params":{"format":"json"},"timestamp":"2025-03-06T12:28:32.661Z","url":"https://nominatim.openstreetmap.org"}
+{"error":"Request failed with status code 400","level":"error","message":"Country code detection failed","timestamp":"2025-03-06T12:28:32.661Z"}
+{"error":"Cannot read properties of undefined (reading '0')","level":"warn","message":"Transport analysis degraded","timestamp":"2025-03-06T12:28:33.177Z"}
+{"error":"getaddrinfo ENOTFOUND flood.nasa.gov","level":"error","location":"-17.8336494149282,31.335718189445483","message":"Historical flood risk calculation failed","timestamp":"2025-03-06T12:28:33.574Z"}
+{"level":"info","message":"making request to overpass api","timestamp":"2025-03-06T12:40:47.470Z"}
+{"error":"Cannot read properties of undefined (reading '0')","level":"warn","message":"Transport analysis degraded","timestamp":"2025-03-06T12:40:52.209Z"}
+{"error":"getaddrinfo ENOTFOUND flood.nasa.gov","level":"warn","message":"GFMS API request failed","timestamp":"2025-03-06T12:40:58.425Z"}
+{"error":"Request failed with status code 404","level":"warn","message":"DFO API request failed","timestamp":"2025-03-06T12:40:59.402Z"}
+{"level":"info","message":"making request to overpass api","timestamp":"2025-03-06T13:00:26.459Z"}
+{"level":"warn","message":"No settlements provided for optimization","timestamp":"2025-03-06T13:00:29.664Z"}
+{"error":"Cannot read properties of undefined (reading '0')","level":"warn","message":"Transport analysis degraded","timestamp":"2025-03-06T13:00:29.665Z"}
+{"error":"getaddrinfo ENOTFOUND flood.nasa.gov","level":"warn","message":"GFMS API request failed","timestamp":"2025-03-06T13:00:30.711Z"}
+{"error":"Request failed with status code 404","level":"warn","message":"DFO API request failed","timestamp":"2025-03-06T13:00:31.321Z"}
+{"level":"info","message":"making request to overpass api","timestamp":"2025-03-06T13:09:48.601Z"}
+{"level":"warn","message":"No settlements provided for optimization","timestamp":"2025-03-06T13:09:53.112Z"}
+{"error":"Cannot read properties of undefined (reading '0')","level":"warn","message":"Transport analysis degraded","timestamp":"2025-03-06T13:09:53.114Z"}
+{"error":"getaddrinfo ENOTFOUND flood.nasa.gov","level":"warn","message":"GFMS API request failed","timestamp":"2025-03-06T13:09:54.859Z"}
+{"error":"Request failed with status code 404","level":"warn","message":"DFO API request failed","timestamp":"2025-03-06T13:09:55.472Z"}
+{"level":"info","message":"making request to overpass api","timestamp":"2025-03-06T13:12:08.725Z"}
+{"data":{"elements":[],"generator":"Overpass API 0.7.62.5 1bd436f1","osm3s":{"copyright":"The data included in this document is from www.openstreetmap.org. The data is made available under ODbL.","timestamp_osm_base":"2025-03-06T13:11:11Z"},"version":0.6},"level":"info","message":"response from overpass api","timestamp":"2025-03-06T13:12:11.214Z"}
+{"level":"warn","message":"No settlements provided for optimization","timestamp":"2025-03-06T13:12:11.215Z"}
+{"error":"Cannot read properties of undefined (reading '0')","level":"warn","message":"Transport analysis degraded","timestamp":"2025-03-06T13:12:11.216Z"}
+{"error":"getaddrinfo ENOTFOUND flood.nasa.gov","level":"warn","message":"GFMS API request failed","timestamp":"2025-03-06T13:12:12.570Z"}
+{"error":"Request failed with status code 404","level":"warn","message":"DFO API request failed","timestamp":"2025-03-06T13:12:15.482Z"}
