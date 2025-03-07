@@ -7,6 +7,7 @@ const openmeteo = require('openmeteo');
 
 const AgriculturalLandAnalyzer = require('../utils/elevation-analysis');
 const GeospatialAccessibilityAssessment = require('../utils/geospatial-accessibility-analysis');
+const FarmRouteAnalyzer = require('../utils/field-accessibility-analysis');
 
 const OPENTOPOGRAPHY_KEY = process.env.OPENTOPOGRAPHY_KEY;
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
@@ -67,10 +68,30 @@ class BoreholeSiteService {
 
             const center = area.centroid().coordinates().getInfo();
             const [lon, lat] = center;
-            const geospatialAccessibilityAssessment = new GeospatialAccessibilityAssessment(lat, lon);
-            geospatialAccessibilityAssessment.assessAccessibility().then(result => {
-                console.log('Comprehensive Accessibility Assessment:', result);
-            });
+            // const geospatialAccessibilityAssessment = new GeospatialAccessibilityAssessment(lat, lon);
+            // geospatialAccessibilityAssessment.assessAccessibility().then(result => {
+            //     console.log('Comprehensive Accessibility Assessment:', result);
+            // });
+
+            // Example Usage
+            (async () => {
+                try {
+                    const analyzer = new FarmRouteAnalyzer();
+                    const analysis = await analyzer.analyzeRouteQuality(
+                        { lat: lat, lon: lon }, // field location
+                        { lat: -17.824858, lon: 31.053028 }    // Harare
+                    );
+
+                    console.log('Route Analysis Report:');
+                    console.log(`- Total Distance: ${analysis.metadata.distance.toFixed(0)}m`);
+                    console.log(`- Overall Quality: ${analysis.overallQuality.toFixed(1)}/100`);
+                    console.log(`- Primary Risk: ${analysis.riskAssessment.worstRoadType} (${analysis.riskAssessment.hazardRisk.toFixed(2)} risk)`);
+                    console.log(`- Hazards: ${analysis.riskAssessment.bridges} bridges, ${analysis.riskAssessment.waterCrossings} water crossings`);
+                } catch (error) {
+                    console.error('Critical analysis failure:', error);
+                    process.exit(1);
+                }
+            })();
 
             // Perform groundwater potential analysis
             const { potentialMap, precipitationAnalysis } = await this.calculateGroundwaterPotential(area);
