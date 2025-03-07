@@ -161,13 +161,15 @@ class FarmRouteAnalyzer {
         const buffered = turf.buffer(geometry, 0.02, { units: 'kilometers' });
         const bbox = turf.bbox(buffered);
 
-        return `[out:json][timeout:25];
+        return `
+            [out:json][timeout:25];
             (
                 way[bridge=yes](${bbox[1]},${bbox[0]},${bbox[3]},${bbox[2]});
                 way["waterway"~"river|stream"](${bbox[1]},${bbox[0]},${bbox[3]},${bbox[2]});
                 way["natural"~"water|landslide"](${bbox[1]},${bbox[0]},${bbox[3]},${bbox[2]});
             );
-            out body;`;
+            out body;
+        `.trim(); // Removes leading/trailing whitespace but keeps formatting
     }
 
     // Enhanced hazard analysis with caching
@@ -182,21 +184,29 @@ class FarmRouteAnalyzer {
         const timeoutId = setTimeout(() => controller.abort(), this.overpassConfig.timeout);
 
         try {
-            const response = await fetch(this.overpassConfig.url, {
-                method: 'POST',
-                body: this.buildOverpassQuery(geometry),
-                signal: controller.signal
-            });
+            // Ensure the query is awaited before use
+            const query = await this.buildOverpassQuery(geometry);
+            console.log('Query:', query);
 
-            const data = await response.json();
-            if (!this.validateApiResponse(data, 'overpass')) {
+            const response = await axios.post(
+                this.overpassConfig.url,
+                `data=${encodeURIComponent(query)}`, // Correctly format the body
+                {
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    signal: controller.signal
+                }
+            );
+
+            console.log('Response:', response.data);
+
+            if (!this.validateApiResponse(response.data, 'overpass')) {
                 throw new Error('Invalid hazard data format');
             }
 
             const result = {
-                bridges: this.processBridgeElements(data),
-                water: this.processWaterElements(data),
-                landslides: this.processLandslideElements(data)
+                bridges: this.processBridgeElements(response.data),
+                water: this.processWaterElements(response.data),
+                landslides: this.processLandslideElements(response.data)
             };
 
             this.overpassCache.set(cacheKey, result);
