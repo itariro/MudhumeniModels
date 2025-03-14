@@ -87,6 +87,8 @@ class BoreholeSiteService {
                     console.log(`- Overall Quality: ${analysis.overallQuality.toFixed(1)}/100`);
                     console.log(`- Primary Risk: ${analysis.riskAssessment.worstRoadType} (${analysis.riskAssessment.hazardRisk.toFixed(2)} risk)`);
                     console.log(`- Hazards: ${analysis.riskAssessment.bridges} bridges, ${analysis.riskAssessment.waterCrossings} water crossings`);
+                    console.log(`- Analysis: ${JSON.stringify(analysis)}`);
+
                 } catch (error) {
                     console.error('Critical analysis failure:', error);
                     process.exit(1);

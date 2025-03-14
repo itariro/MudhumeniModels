@@ -51,6 +51,7 @@ class FarmRouteAnalyzer {
             }
             const analysis = await this.processRouteData(routeData);
             const enhancedAnalysis = await this.enhanceWithHazards(analysis);
+            console.log('Enhanced Analysis:', enhancedAnalysis);
 
             return this.formatResults(enhancedAnalysis, routeData);
         } catch (error) {
@@ -311,9 +312,14 @@ class FarmRouteAnalyzer {
     }
 
     analyzeSegments(groups, coords, totalDistance) {
+        console.log('Analyzing segments...');
         return groups.map(group => {
+            
             const segmentCoords = coords.slice(group.start_index, group.end_index + 1);
-            const length = this.computeSegmentLength(segmentCoords);
+            // console.log(`Segment Coordinates: ${segmentCoords}`);
+            console.log("segmentCoords: ", segmentCoords.join(','));
+            const length = this.computeSegmentLength(this.convertToCoordinates(segmentCoords.join(',')));
+            console.log(`Analyzing segment: ${group.value} - Length: ${length}`);
 
             return {
                 roadType: group.value,
@@ -327,10 +333,52 @@ class FarmRouteAnalyzer {
     }
 
     computeSegmentLength(coords) {
-        return coords.slice(1).reduce((total, [lon, lat], i) => {
-            const [prevLon, prevLat] = coords[i];
-            return total + this.haversineDistance(prevLat, prevLon, lat, lon);
-        }, 0);
+        console.log('Computing segment length...');
+        console.log('Coordinates:', coords);
+        if (!Array.isArray(coords) || coords.length < 2) {
+            throw new Error('Invalid coordinates: Array must contain at least 2 coordinate pairs');
+        }
+
+        try {
+            return coords.slice(1).reduce((total, [lon, lat], i) => {
+                if (!Array.isArray(coords[i]) || coords[i].length !== 2 || 
+                    typeof lon !== 'number' || typeof lat !== 'number' ||
+                    isNaN(lon) || isNaN(lat)) {
+                    throw new Error(`Invalid coordinate pair at index ${i}`);
+                }
+                
+                const [prevLon, prevLat] = coords[i];
+                if (typeof prevLon !== 'number' || typeof prevLat !== 'number' ||
+                    isNaN(prevLon) || isNaN(prevLat)) {
+                    throw new Error(`Invalid previous coordinate pair at index ${i}`);
+                }
+
+                return total + this.haversineDistance(prevLat, prevLon, lat, lon);
+            }, 0);
+        } catch (error) {
+            throw new Error(`Failed to compute segment length: ${error.message}`);
+        }
+    }
+
+    convertToCoordinates(data) {
+        // Split the data into an array of strings
+        const dataArray = data.split(',');
+    
+        // Initialize an empty array to hold the coordinates
+        const coordinates = [];
+    
+        // Iterate over the data array in steps of 2 (since longitude and latitude come in pairs)
+        for (let i = 1; i < dataArray.length; i += 2) {
+            const longitude = parseFloat(dataArray[i]);
+            const latitude = parseFloat(dataArray[i + 1]);
+    
+            // Check if both longitude and latitude are valid numbers
+            if (!isNaN(longitude) && !isNaN(latitude)) {
+                coordinates.push([longitude, latitude]);
+            }
+        }
+    
+        return coordinates;
     }
 
     determineWorstRoad(segments) {
