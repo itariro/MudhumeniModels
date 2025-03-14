@@ -4,6 +4,7 @@ const dotenv = require('dotenv');
 const Ajv = require('ajv');
 const { LRUCache } = require('lru-cache');
 const { orsSchema, overpassSchema } = require('../schemas/overpass.schema.js');
+const { default: def } = require('ajv/dist/vocabularies/applicator/additionalItems.js');
 
 dotenv.config();
 
@@ -30,9 +31,33 @@ class FarmRouteAnalyzer {
 
     initRoadMetrics() {
         return {
-            ranking: JSON.parse(process.env.ROAD_RANKING || '{}') || { /* default ranking */ },
-            weights: JSON.parse(process.env.ROAD_WEIGHTS || '{}') || { /* default weights */ },
-            hazardWeights: {
+            ranking: {
+                motorway: 1,
+                trunk: 0.9,
+                primary: 0.8,
+                secondary: 0.7,
+                tertiary: 0.6,
+                residential: 0.5,
+                unclassified: 0.4,
+                track: 0.3,
+                path: 0.2,
+                service: 0.4,
+                default: 0.5
+            },
+            weights: {
+                surface_paved: 1.0,
+                surface_asphalt: 1.0,
+                surface_concrete: 0.9,
+                surface_gravel: 0.6,
+                surface_unpaved: 0.4,
+                surface_dirt: 0.3,
+                surface_grass: 0.2,
+                width_wide: 1.0,
+                width_medium: 0.7,
+                width_narrow: 0.4,
+                width_very_narrow: 0.2,
+                default: 0.5
+            }, hazardWeights: {
                 bridge: parseFloat(process.env.HAZARD_WEIGHT_BRIDGE) || 0.2,
                 water: parseFloat(process.env.HAZARD_WEIGHT_WATER) || 0.1,
                 landslide: parseFloat(process.env.HAZARD_WEIGHT_LANDSLIDE) || 0.3
@@ -51,8 +76,6 @@ class FarmRouteAnalyzer {
             }
             const analysis = await this.processRouteData(routeData);
             const enhancedAnalysis = await this.enhanceWithHazards(analysis);
-            console.log('Enhanced Analysis:', enhancedAnalysis);
-
             return this.formatResults(enhancedAnalysis, routeData);
         } catch (error) {
             this.handleError(error, 'Route analysis failed');
@@ -133,16 +156,9 @@ class FarmRouteAnalyzer {
 
     //#region Analysis Enhancements
     async enhanceWithHazards(analysis) {
-        console.log('Enhancing analysis with hazards...');
-        console.log('Analysis:', analysis);
         try {
             const hazardLine = await this.createHazardLineString(analysis.segments, analysis.geometry);
-            console.log('Hazard line:', hazardLine);
-
-            console.log('Querying hazards...');
             const hazards = await this.queryHazards(hazardLine);
-            console.log('Hazards:', hazards);
-
             return {
                 ...analysis,
                 hazards: {
@@ -187,8 +203,6 @@ class FarmRouteAnalyzer {
         try {
             // Ensure the query is awaited before use
             const query = await this.buildOverpassQuery(geometry);
-            console.log('Query:', query);
-
             const response = await axios.post(
                 this.overpassConfig.url,
                 `data=${encodeURIComponent(query)}`, // Correctly format the body
@@ -197,9 +211,7 @@ class FarmRouteAnalyzer {
                     signal: controller.signal
                 }
             );
-
-            console.log('Response:', response.data);
-
+            
             if (!this.validateApiResponse(response.data, 'overpass')) {
                 throw new Error('Invalid hazard data format');
             }
@@ -230,9 +242,6 @@ class FarmRouteAnalyzer {
     createHazardLineString(segments, routeGeometry) {
         const MAX_POINTS = 1000;
         const coordinates = [];
-
-        console.log('Processing coordinates for hazard line...');
-        console.log('Segments:', segments);
 
         for (const seg of segments) {
             coordinates.push(...seg.coordinates.map(([lon, lat]) => [
@@ -312,15 +321,9 @@ class FarmRouteAnalyzer {
     }
 
     analyzeSegments(groups, coords, totalDistance) {
-        console.log('Analyzing segments...');
         return groups.map(group => {
-            
             const segmentCoords = coords.slice(group.start_index, group.end_index + 1);
-            // console.log(`Segment Coordinates: ${segmentCoords}`);
-            console.log("segmentCoords: ", segmentCoords.join(','));
             const length = this.computeSegmentLength(this.convertToCoordinates(segmentCoords.join(',')));
-            console.log(`Analyzing segment: ${group.value} - Length: ${length}`);
-
             return {
                 roadType: group.value,
                 length,
@@ -333,20 +336,18 @@ class FarmRouteAnalyzer {
     }
 
     computeSegmentLength(coords) {
-        console.log('Computing segment length...');
-        console.log('Coordinates:', coords);
         if (!Array.isArray(coords) || coords.length < 2) {
             throw new Error('Invalid coordinates: Array must contain at least 2 coordinate pairs');
         }
 
         try {
             return coords.slice(1).reduce((total, [lon, lat], i) => {
-                if (!Array.isArray(coords[i]) || coords[i].length !== 2 || 
+                if (!Array.isArray(coords[i]) || coords[i].length !== 2 ||
                     typeof lon !== 'number' || typeof lat !== 'number' ||
                     isNaN(lon) || isNaN(lat)) {
                     throw new Error(`Invalid coordinate pair at index ${i}`);
                 }
-                
+
                 const [prevLon, prevLat] = coords[i];
                 if (typeof prevLon !== 'number' || typeof prevLat !== 'number' ||
                     isNaN(prevLon) || isNaN(prevLat)) {
@@ -363,21 +364,21 @@ class FarmRouteAnalyzer {
     convertToCoordinates(data) {
         // Split the data into an array of strings
         const dataArray = data.split(',');
-    
+
         // Initialize an empty array to hold the coordinates
         const coordinates = [];
-    
+
         // Iterate over the data array in steps of 2 (since longitude and latitude come in pairs)
         for (let i = 1; i < dataArray.length; i += 2) {
             const longitude = parseFloat(dataArray[i]);
             const latitude = parseFloat(dataArray[i + 1]);
-    
+
             // Check if both longitude and latitude are valid numbers
             if (!isNaN(longitude) && !isNaN(latitude)) {
                 coordinates.push([longitude, latitude]);
             }
         }
-    
+
         return coordinates;
     }
 
