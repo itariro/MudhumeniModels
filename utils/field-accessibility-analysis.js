@@ -27,6 +27,8 @@ class FarmRouteAnalyzer {
         this.overpassCache = new LRUCache({ max: this.overpassConfig.cacheMax });
         this.requestQueue = [];
         this.rateLimit = parseInt(process.env.RATE_LIMIT) || 5; // Requests per second
+        this.lastRequest = 0;
+        this.RATE_LIMIT_INTERVAL = 5000; // 5 seconds between requests
     }
 
     initRoadMetrics() {
@@ -190,43 +192,126 @@ class FarmRouteAnalyzer {
     }
 
     // Enhanced hazard analysis with caching
+    // async queryHazards(geometry) {
+    //     const cacheKey = `hazards_${this.hashGeometry(geometry)}`;
+    //     const cached = this.overpassCache.get(cacheKey);
+    //     if (cached) return cached;
+
+    //     await this.rateLimitCheck();
+
+    //     const controller = new AbortController();
+    //     const timeoutId = setTimeout(() => controller.abort(), this.overpassConfig.timeout);
+
+    //     try {
+    //         // Ensure the query is awaited before use
+    //         const query = await this.buildOverpassQuery(geometry);
+    //         const response = await axios.post(
+    //             this.overpassConfig.url,
+    //             `data=${encodeURIComponent(query)}`, // Correctly format the body
+    //             {
+    //                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    //                 signal: controller.signal
+    //             }
+    //         );
+
+    //         if (!this.validateApiResponse(response.data, 'overpass')) {
+    //             throw new Error('Invalid hazard data format');
+    //         }
+
+    //         const result = {
+    //             bridges: this.processBridgeElements(response.data),
+    //             water: this.processWaterElements(response.data),
+    //             landslides: this.processLandslideElements(response.data)
+    //         };
+
+    //         this.overpassCache.set(cacheKey, result);
+    //         return result;
+    //     } finally {
+    //         clearTimeout(timeoutId);
+    //     }
+    // }
+
     async queryHazards(geometry) {
         const cacheKey = `hazards_${this.hashGeometry(geometry)}`;
         const cached = this.overpassCache.get(cacheKey);
         if (cached) return cached;
 
-        await this.rateLimitCheck();
+        const MAX_RETRIES = 3;
+        let retryCount = 0;
+        let response;
 
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), this.overpassConfig.timeout);
+        while (retryCount <= MAX_RETRIES) {
+            let timeoutId;
+            const controller = new AbortController();
+            timeoutId = setTimeout(() => controller.abort(), this.overpassConfig.timeout);
 
-        try {
-            // Ensure the query is awaited before use
-            const query = await this.buildOverpassQuery(geometry);
-            const response = await axios.post(
-                this.overpassConfig.url,
-                `data=${encodeURIComponent(query)}`, // Correctly format the body
-                {
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    signal: controller.signal
+            try {
+                await this.rateLimitCheckHazardQuery(); // Client-side rate limiting
+
+                const query = await this.buildOverpassQuery(geometry);
+                response = await axios.post(
+                    this.overpassConfig.url,
+                    `data=${encodeURIComponent(query)}`,
+                    {
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        signal: controller.signal
+                    }
+                );
+
+                clearTimeout(timeoutId);
+
+                // Handle HTTP 429 from server
+                if (response.status === 429) {
+                    throw new axios.AxiosError('Rate limit exceeded', null, null, null, response);
                 }
-            );
-            
-            if (!this.validateApiResponse(response.data, 'overpass')) {
-                throw new Error('Invalid hazard data format');
+
+                // Validate response structure
+                if (!this.validateApiResponse(response.data, 'overpass')) {
+                    throw new Error('Invalid hazard data format');
+                }
+
+                // Exit loop on success
+                break;
+            } catch (error) {
+                clearTimeout(timeoutId);
+
+                // Determine if retry is needed
+                const isRateLimit = error.response?.status === 429;
+                const isTimeout = error.code === 'ECONNABORTED' || error.name === 'AbortError';
+
+                if (retryCount >= MAX_RETRIES) {
+                    throw new Error(`Request failed after ${MAX_RETRIES} retries: ${error.message}`);
+                }
+
+                if (isRateLimit || isTimeout) {
+                    // Calculate delay with exponential backoff and jitter
+                    const retryAfterHeader = error.response?.headers?.['retry-after'];
+                    const baseDelay = retryAfterHeader
+                        ? parseInt(retryAfterHeader) * 1000
+                        : Math.pow(2, retryCount) * 1000;
+
+                    const jitter = Math.random() * 1000;
+                    const delay = baseDelay + jitter;
+
+                    console.warn(`Retry ${retryCount + 1}/${MAX_RETRIES} in ${delay}ms`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    retryCount++;
+                } else {
+                    // Non-retryable error
+                    throw error;
+                }
             }
-
-            const result = {
-                bridges: this.processBridgeElements(response.data),
-                water: this.processWaterElements(response.data),
-                landslides: this.processLandslideElements(response.data)
-            };
-
-            this.overpassCache.set(cacheKey, result);
-            return result;
-        } finally {
-            clearTimeout(timeoutId);
         }
+
+        // Process and cache successful response
+        const result = {
+            bridges: this.processBridgeElements(response.data),
+            water: this.processWaterElements(response.data),
+            landslides: this.processLandslideElements(response.data)
+        };
+
+        this.overpassCache.set(cacheKey, result);
+        return result;
     }
 
     // Improved risk calculation with configurable weights
@@ -277,6 +362,17 @@ class FarmRouteAnalyzer {
         }
 
         this.requestQueue.push(Date.now());
+    }
+
+    async rateLimitCheckHazardQuery() {
+        const now = Date.now();
+        const elapsed = now - this.lastRequest;
+        if (elapsed < this.RATE_LIMIT_INTERVAL) {
+            await new Promise(resolve =>
+                setTimeout(resolve, this.RATE_LIMIT_INTERVAL - elapsed)
+            );
+        }
+        this.lastRequest = Date.now();
     }
 
     // Utility improvements
