@@ -346,20 +346,17 @@ class FarmRouteAnalyzer {
             // Get basic distance metrics
             console.log("Calculating accessibility metrics...");
             const accessibilityMetrics = await this.calculateAccessibilityMetrics(coordinates);
-            console.log("Accessibility metrics:", JSON.stringify(accessibilityMetrics));
 
             // Calculate hazards for each road type
             console.log("Calculating hazards...");
             const hazards = await this.calculateHazardsForRoads(coordinates, accessibilityMetrics);
-            console.log("Hazards:", JSON.stringify(hazards));
 
             const result = {
                 metrics: accessibilityMetrics,
                 hazards: hazards,
                 overall_accessibility_score: this.calculateOverallAccessibilityScore(accessibilityMetrics, hazards)
             };
-
-            console.log("Analysis complete:", JSON.stringify(result));
+            console.log("Field accessibility analysis completed successfully.");
             return result;
         } catch (error) {
             console.error("Field accessibility analysis failed:", error);
@@ -556,7 +553,6 @@ class FarmRouteAnalyzer {
         // First, determine the country based on coordinates
         try {
             const country = await this.determineCountry(coordinates);
-            console.log(`Determined country: ${country}`);
 
             // More flexible query for cities and towns
             const query = `
@@ -577,17 +573,12 @@ class FarmRouteAnalyzer {
                 cacheKey
             );
 
-            console.log(`Found ${data.elements.length} population centers`);
-
             // Find cities and towns
             const cities = data.elements.filter(el => el.tags.place === "city");
             const capitalCity = cities.find(el => el.tags.capital === "yes" || el.tags.admin_level === "2");
 
             const towns = data.elements.filter(el => el.tags.place === "town");
             const adminTown = towns.find(el => el.tags.admin_level);
-
-            console.log(`Cities: ${cities.length}, Towns: ${towns.length}`);
-            console.log(`Capital: ${capitalCity ? 'found' : 'not found'}, Admin town: ${adminTown ? 'found' : 'not found'}`);
 
             // If we can't find a specific capital or admin town, use the nearest city and town
             const nearestCity = cities.length > 0 ?
