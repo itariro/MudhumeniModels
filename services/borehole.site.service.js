@@ -103,6 +103,8 @@ class BoreholeSiteService {
                 // })).then(results => {
                 //     AccessibilityAnalysis = results;
                 // });
+                const analyzer = new FarmRouteAnalyzer();
+                AccessibilityAnalysis = await analyzer.analyzeFieldAccessibility({ lat, lon });
             } catch (error) {
                 logger.error('Accessibility analysis failed:', error);
                 throw new Error(`Failed to analyze route accessibility: ${error.message}`);
@@ -126,14 +128,14 @@ class BoreholeSiteService {
             return {
                 viability: { fieldPotentialAnalysis },
                 environment: {
-                    precipitation : precipitationAnalysis,
+                    precipitation: precipitationAnalysis,
                     water: {
                         waterAvailability,
                         boreholeDepthAnalysis,
                         boreholeSucessAnalysis
                     },
                     hydroGeologicalFeatures,
-                    potentialMap,                    
+                    potentialMap,
                 },
                 accessibility: { AccessibilityAnalysis },
             };

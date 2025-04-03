@@ -67,22 +67,23 @@ class FarmRouteAnalyzer {
         };
     }
 
-    async analyzeRouteQuality(start, end) {
-        this.validateCoordinates(start, end);
-        const cacheKey = this.generateCacheKey(start, end);
+    // TODO: DEPRECATED: This method is not used anymore
+    // async analyzeRouteQuality(start, end) {
+    //     this.validateCoordinates(start, end);
+    //     const cacheKey = this.generateCacheKey(start, end);
 
-        try {
-            const routeData = await this.fetchRouteData(start, end);
-            if (!this.validateApiResponse(routeData, 'ors')) {
-                throw new Error('Invalid route data format');
-            }
-            const analysis = await this.processRouteData(routeData);
-            const enhancedAnalysis = await this.enhanceWithHazards(analysis);
-            return this.formatResults(enhancedAnalysis, routeData);
-        } catch (error) {
-            this.handleError(error, 'Route analysis failed');
-        }
-    }
+    //     try {
+    //         const routeData = await this.fetchRouteData(start, end);
+    //         if (!this.validateApiResponse(routeData, 'ors')) {
+    //             throw new Error('Invalid route data format');
+    //         }
+    //         const analysis = await this.processRouteData(routeData);
+    //         const enhancedAnalysis = await this.enhanceWithHazards(analysis);
+    //         return this.formatResults(enhancedAnalysis, routeData);
+    //     } catch (error) {
+    //         this.handleError(error, 'Route analysis failed');
+    //     }
+    // }
 
     async fetchWithRetry(fetchFn, cacheKey, maxRetries = 3, delay = 1000) {
         if (this.overpassCache.has(cacheKey)) {
@@ -365,6 +366,19 @@ class FarmRouteAnalyzer {
         validate(end, 'end');
     }
 
+    validateCoordinatesRefactored(start) {
+        const validate = (coord, name) => {
+            if (!coord || typeof coord.lat !== 'number' || typeof coord.lon !== 'number') {
+                throw new Error(`Invalid ${name} coordinates`);
+            }
+            if (isNaN(coord.lat) || isNaN(coord.lon)) {
+                throw new Error(`Invalid ${name} coordinates: Lat/Lon must be numbers`);
+            }
+        };
+
+        validate(start, 'start');
+    }
+
     extractWaytypeGroups(feature) {
         const fallbackGroup = [{
             start_index: 0,
@@ -524,6 +538,373 @@ class FarmRouteAnalyzer {
         console.error(`${context}:`, error);
         throw this.enhanceError(error, context);
     }
+
+    async analyzeFieldAccessibility(coordinates) {
+        console.log(`Analyzing field accessibility for coordinates: ${JSON.stringify(coordinates)}`);
+        
+        try {
+            // Get basic distance metrics
+            console.log("Calculating accessibility metrics...");
+            const accessibilityMetrics = await this.calculateAccessibilityMetrics(coordinates);
+            console.log("Accessibility metrics:", JSON.stringify(accessibilityMetrics));
+            
+            // Calculate hazards for each road type
+            console.log("Calculating hazards...");
+            const hazards = await this.calculateHazardsForRoads(coordinates, accessibilityMetrics);
+            console.log("Hazards:", JSON.stringify(hazards));
+            
+            const result = {
+                metrics: accessibilityMetrics,
+                hazards: hazards,
+                overall_accessibility_score: this.calculateOverallAccessibilityScore(accessibilityMetrics, hazards)
+            };
+            
+            console.log("Analysis complete:", JSON.stringify(result));
+            return result;
+        } catch (error) {
+            console.error("Field accessibility analysis failed:", error);
+            throw error;
+        }
+    }
+    
+    async calculateHazardsForRoads(coordinates, metrics) {
+        // We can reuse the existing hazard analysis logic but apply it to each road type
+        // This is a simplified version - you'd need to expand this
+        const hazards = {};
+
+        // For each road type, calculate hazards along the route to that road
+        for (const roadType of ['primary', 'secondary', 'tertiary', 'city', 'town']) {
+            if (metrics[`distance_to_${roadType}`] > 0) {
+                // Create a simple line from coordinates to nearest point of this type
+                // This is simplified - you'd need actual route geometry
+                const lineString = this.createSimpleLineString(coordinates, roadType, metrics);
+
+                // Use existing hazard analysis
+                const hazardAnalysis = await this.queryHazards(lineString);
+
+                hazards[roadType] = {
+                    bridges: hazardAnalysis.bridges.length,
+                    water_crossings: hazardAnalysis.water.length,
+                    landslides: hazardAnalysis.landslides.length,
+                    risk_score: this.calculateCompositeRisk(hazardAnalysis)
+                };
+            } else {
+                hazards[roadType] = { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 };
+            }
+        }
+
+        return hazards;
+    }
+
+    calculateOverallAccessibilityScore(metrics, hazards) {
+        // Calculate a weighted score based on distances and hazards
+        // This is a simple example - you'd want to refine this formula
+        let score = 0;
+        const weights = {
+            primary: 0.3,
+            secondary: 0.25,
+            tertiary: 0.2,
+            city: 0.15,
+            town: 0.1
+        };
+
+        for (const type in weights) {
+            const distance = metrics[`distance_to_${type}`];
+            if (distance > 0) {
+                // Normalize distance (closer is better)
+                const normalizedDistance = Math.min(1, 10000 / distance);
+                // Factor in hazards
+                const hazardPenalty = hazards[type] ? hazards[type].risk_score : 0;
+
+                score += weights[type] * normalizedDistance * (1 - hazardPenalty);
+            }
+        }
+
+        return score;
+    }
+
+    createSimpleLineString(coordinates, roadType, metrics) {
+        // This is a placeholder - in reality, you'd need to get the actual coordinates
+        // of the nearest road/city/town point
+
+        // For now, we'll create a dummy line with a length proportional to the distance
+        const distance = metrics[`distance_to_${roadType}`];
+        const angle = Math.random() * Math.PI * 2; // Random direction
+
+        // Calculate a point roughly in the direction of the nearest feature
+        // This is just for demonstration - not accurate
+        const endLat = coordinates.lat + (Math.sin(angle) * distance / 111000);
+        const endLon = coordinates.lon + (Math.cos(angle) * distance / (111000 * Math.cos(coordinates.lat * Math.PI / 180)));
+
+        return turf.lineString([
+            [coordinates.lon, coordinates.lat],
+            [endLon, endLat]
+        ]);
+    }
+
+    // TODO: new streamlined methods here
+    async calculateAccessibilityMetrics(coordinates) {
+        try {
+            // Validate input coordinates
+            this.validateCoordinatesRefactored(coordinates);
+
+            // Calculate distances to different road types
+            const roadDistances = await this.calculateRoadDistances(coordinates);
+
+            // Calculate distances to population centers
+            const populationDistances = await this.calculatePopulationDistances(coordinates);
+
+            return {
+                ...roadDistances,
+                ...populationDistances
+            };
+        } catch (error) {
+            this.handleError(error, 'Accessibility metrics calculation failed');
+        }
+    }
+
+    async calculateRoadDistances(coordinates) {
+        // Increase the search radius and simplify the query
+        const query = `
+            [out:json][timeout:60];
+            (
+                way["highway"="primary"](around:50000,${coordinates.lat},${coordinates.lon});
+                way["highway"="secondary"](around:50000,${coordinates.lat},${coordinates.lon});
+                way["highway"="tertiary"](around:50000,${coordinates.lat},${coordinates.lon});
+            );
+            out geom;
+        `;
+
+        const cacheKey = `roads_${coordinates.lat}_${coordinates.lon}`;
+
+        try {
+            const data = await this.fetchWithRetry(
+                () => this.queryOverpass(query),
+                cacheKey
+            );
+
+            console.log(`Found ${data.elements.length} road elements`);
+
+            // Process the results to find nearest roads of each type
+            const primaryRoads = data.elements.filter(el => el.tags.highway === "primary");
+            const secondaryRoads = data.elements.filter(el => el.tags.highway === "secondary");
+            const tertiaryRoads = data.elements.filter(el => el.tags.highway === "tertiary");
+
+            console.log(`Primary: ${primaryRoads.length}, Secondary: ${secondaryRoads.length}, Tertiary: ${tertiaryRoads.length}`);
+
+            return {
+                distance_to_primary: this.calculateNearestDistance(coordinates, primaryRoads),
+                distance_to_secondary: this.calculateNearestDistance(coordinates, secondaryRoads),
+                distance_to_tertiary: this.calculateNearestDistance(coordinates, tertiaryRoads)
+            };
+        } catch (error) {
+            console.error("Road distance calculation failed:", error);
+            return {
+                distance_to_primary: -1,
+                distance_to_secondary: -1,
+                distance_to_tertiary: -1
+            };
+        }
+    }
+
+    calculateNearestDistance(coordinates, elements) {
+        if (!elements || elements.length === 0) {
+            console.log("No elements found for distance calculation");
+            return -1;
+        }
+
+        let minDistance = Infinity;
+
+        for (const element of elements) {
+            // Handle different element types (nodes vs ways)
+            if (element.type === "node") {
+                const distance = this.haversineDistance(
+                    coordinates.lat, coordinates.lon,
+                    element.lat, element.lon
+                );
+
+                if (distance < minDistance) {
+                    minDistance = distance;
+                }
+            }
+            // For ways, check each point in the geometry
+            else if (element.geometry) {
+                for (const point of element.geometry) {
+                    const distance = this.haversineDistance(
+                        coordinates.lat, coordinates.lon,
+                        point.lat, point.lon
+                    );
+
+                    if (distance < minDistance) {
+                        minDistance = distance;
+                    }
+                }
+            }
+        }
+
+        if (minDistance === Infinity) {
+            console.log("Could not calculate minimum distance");
+            return -1;
+        }
+
+        console.log(`Calculated minimum distance: ${minDistance}`);
+        return minDistance;
+    }
+
+
+    async calculatePopulationDistances(coordinates) {
+        // First, determine the country based on coordinates
+        try {
+            const country = await this.determineCountry(coordinates);
+            console.log(`Determined country: ${country}`);
+
+            // More flexible query for cities and towns
+            const query = `
+                [out:json][timeout:60];
+                (
+                    // Look for capital cities
+                    node["place"="city"](around:200000,${coordinates.lat},${coordinates.lon});
+                    // Look for administrative towns
+                    node["place"="town"](around:100000,${coordinates.lat},${coordinates.lon});
+                );
+                out body;
+            `;
+
+            const cacheKey = `population_${coordinates.lat}_${coordinates.lon}`;
+
+            const data = await this.fetchWithRetry(
+                () => this.queryOverpass(query),
+                cacheKey
+            );
+
+            console.log(`Found ${data.elements.length} population centers`);
+
+            // Find cities and towns
+            const cities = data.elements.filter(el => el.tags.place === "city");
+            const capitalCity = cities.find(el => el.tags.capital === "yes" || el.tags.admin_level === "2");
+
+            const towns = data.elements.filter(el => el.tags.place === "town");
+            const adminTown = towns.find(el => el.tags.admin_level);
+
+            console.log(`Cities: ${cities.length}, Towns: ${towns.length}`);
+            console.log(`Capital: ${capitalCity ? 'found' : 'not found'}, Admin town: ${adminTown ? 'found' : 'not found'}`);
+
+            // If we can't find a specific capital or admin town, use the nearest city and town
+            const nearestCity = cities.length > 0 ?
+                this.findNearestPlace(coordinates, cities) : null;
+
+            const nearestTown = towns.length > 0 ?
+                this.findNearestPlace(coordinates, towns) : null;
+
+            return {
+                distance_to_city: capitalCity ?
+                    this.calculatePointDistance(coordinates, capitalCity) :
+                    (nearestCity ? this.calculatePointDistance(coordinates, nearestCity) : -1),
+
+                distance_to_town: adminTown ?
+                    this.calculatePointDistance(coordinates, adminTown) :
+                    (nearestTown ? this.calculatePointDistance(coordinates, nearestTown) : -1)
+            };
+        } catch (error) {
+            console.error("Population distance calculation failed:", error);
+            return {
+                distance_to_city: -1,
+                distance_to_town: -1
+            };
+        }
+    }
+
+    findNearestPlace(coordinates, places) {
+        if (!places || places.length === 0) return null;
+
+        let nearest = null;
+        let minDistance = Infinity;
+
+        for (const place of places) {
+            const distance = this.haversineDistance(
+                coordinates.lat, coordinates.lon,
+                place.lat, place.lon
+            );
+
+            if (distance < minDistance) {
+                minDistance = distance;
+                nearest = place;
+            }
+        }
+
+        return nearest;
+    }
+
+    calculatePointDistance(coordinates, point) {
+        return this.haversineDistance(
+            coordinates.lat, coordinates.lon,
+            point.lat, point.lon
+        );
+    }
+
+    async determineCountry(coordinates) {
+        try {
+            // Simpler query to determine country
+            const query = `
+                [out:json][timeout:30];
+                is_in(${coordinates.lat},${coordinates.lon});
+                out tags;
+            `;
+
+            const cacheKey = `country_${coordinates.lat}_${coordinates.lon}`;
+
+            const data = await this.fetchWithRetry(
+                () => this.queryOverpass(query),
+                cacheKey
+            );
+
+            console.log(`Country determination returned ${data.elements.length} elements`);
+
+            // Look for country information in any of the returned elements
+            for (const element of data.elements) {
+                if (element.tags) {
+                    if (element.tags.ISO3166) return element.tags.ISO3166;
+                    if (element.tags.country) return element.tags.country;
+                    if (element.tags.name && element.tags.admin_level === "2") return element.tags.name;
+                }
+            }
+
+            return "unknown";
+        } catch (error) {
+            console.error("Country determination failed:", error);
+            return "unknown";
+        }
+    }
+
+
+    async queryOverpass(query) {
+        await this.rateLimitCheck();
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), this.overpassConfig.timeout);
+
+        try {
+            const response = await axios.post(
+                this.overpassConfig.url,
+                `data=${encodeURIComponent(query)}`,
+                {
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    signal: controller.signal
+                }
+            );
+
+            clearTimeout(timeoutId);
+            return response.data;
+        } catch (error) {
+            clearTimeout(timeoutId);
+            throw this.enhanceError(error, 'Overpass query failed');
+        }
+    }
+
+
+
+
+
 }
 
 module.exports = FarmRouteAnalyzer;
