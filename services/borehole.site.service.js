@@ -8,6 +8,8 @@ const openmeteo = require('openmeteo');
 const AgriculturalLandAnalyzer = require('../utils/elevation-analysis');
 const FarmRouteAnalyzer = require('../utils/field-accessibility-analysis');
 const locationsZimbabwe = require('../data/zw.json');
+const hydroGeologicalMapZimbabwe = require('../data/hydrogeological_map_zimbabwe.json');
+const { environment } = require('../config/config');
 
 const OPENTOPOGRAPHY_KEY = process.env.OPENTOPOGRAPHY_KEY;
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
@@ -62,63 +64,78 @@ class BoreholeSiteService {
 
             // Create an Earth Engine polygon
             const area = ee.Geometry.Polygon(polygon.geometry.coordinates);
+            const center = area.centroid().coordinates().getInfo();
+            const [lon, lat] = center;
+
+            const hydroGeologicalFeatures = this.findFeaturesAtPoint(
+                lat,  // Latitude
+                lon,   // Longitude
+                hydroGeologicalMapZimbabwe
+            );
 
             // Perform field potential analysis
             const fieldPotentialAnalysis = []; // await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
 
-            const center = area.centroid().coordinates().getInfo();
-            const [lon, lat] = center;
-
             let AccessibilityAnalysis = [];
             console.log('locationsZimbabwe -> ', locationsZimbabwe);
             try {
-                const analyzer = new FarmRouteAnalyzer();
-                await Promise.all(locationsZimbabwe.map(async (location) => {
-                    const routeAnalysis = await analyzer.analyzeRouteQuality(
-                        { lat, lon }, // field location
-                        { lat: parseFloat(location.lat), lon: parseFloat(location.lng) }
-                    );
+                // TODO: disabled for testing
+                // const analyzer = new FarmRouteAnalyzer();
+                // await Promise.all(locationsZimbabwe.map(async (location) => {
+                //     const routeAnalysis = await analyzer.analyzeRouteQuality(
+                //         { lat, lon }, // field location
+                //         { lat: parseFloat(location.lat), lon: parseFloat(location.lng) }
+                //     );
 
-                    return {
-                        location: location.city,
-                        admin: location.admin_name,
-                        distance: Number(routeAnalysis.metadata.distance).toFixed(0),
-                        overallQuality: (routeAnalysis.overallQuality / 100).toFixed(1),
-                        riskAssessment: {
-                            worstRoadType: routeAnalysis.riskAssessment.worstRoadType,
-                            hazardRisk: Number(routeAnalysis.riskAssessment.hazardRisk).toFixed(2),
-                            bridges: routeAnalysis.riskAssessment.bridges,
-                            waterCrossings: routeAnalysis.riskAssessment.waterCrossings
-                        },
-                        unabridged: routeAnalysis.analysis
-                    };
-                })).then(results => {
-                    AccessibilityAnalysis = results;
-                });
+                //     return {
+                //         location: location.city,
+                //         admin: location.admin_name,
+                //         distance: Number(routeAnalysis.metadata.distance).toFixed(0),
+                //         overallQuality: (routeAnalysis.overallQuality / 100).toFixed(1),
+                //         riskAssessment: {
+                //             worstRoadType: routeAnalysis.riskAssessment.worstRoadType,
+                //             hazardRisk: Number(routeAnalysis.riskAssessment.hazardRisk).toFixed(2),
+                //             bridges: routeAnalysis.riskAssessment.bridges,
+                //             waterCrossings: routeAnalysis.riskAssessment.waterCrossings
+                //         },
+                //         unabridged: routeAnalysis.analysis
+                //     };
+                // })).then(results => {
+                //     AccessibilityAnalysis = results;
+                // });
             } catch (error) {
                 logger.error('Accessibility analysis failed:', error);
                 throw new Error(`Failed to analyze route accessibility: ${error.message}`);
             }
             // Perform groundwater potential analysis
-            const { potentialMap, precipitationAnalysis } = await this.calculateGroundwaterPotential(area);
+            const { potentialMap, precipitationAnalysis, waterAvailability } = await this.calculateGroundwaterPotential(area);
 
             // Estimate borehole depth
             const boreholeDepthAnalysis = await this.estimateBoreholeDepth(area, precipitationAnalysis);
 
             // Calculate success probability
             logger.info('Calculating success probability...');
-            const boreholeSucessAnalysis = this.calculateSuccessProbability(
+            let boreholeSucessAnalysis = {};
+            await this.calculateSuccessProbability(
                 { area }, [], precipitationAnalysis
-            );
+            ).then(result => {
+                boreholeSucessAnalysis = result;
+            });
 
             // Return final response
             return {
-                boreholeSucessAnalysis,
-                potentialMap,
-                precipitationAnalysis,
-                boreholeDepthAnalysis,
-                fieldPotentialAnalysis,
-                AccessibilityAnalysis
+                viability: { fieldPotentialAnalysis },
+                environment: {
+                    precipitation : precipitationAnalysis,
+                    water: {
+                        waterAvailability,
+                        boreholeDepthAnalysis,
+                        boreholeSucessAnalysis
+                    },
+                    hydroGeologicalFeatures,
+                    potentialMap,                    
+                },
+                accessibility: { AccessibilityAnalysis },
             };
         } catch (error) {
             logger.error('Error in identifyLocations:', error);
@@ -164,9 +181,18 @@ class BoreholeSiteService {
             precipScore.multiply(weights.precipitation),
         ]).reduce(ee.Reducer.sum());
 
+        const waterAvailability = await this.estimateTotalWaterAvailability(
+            polygon,
+            precipitationAnalysis,
+            0.4, // Example soil porosity
+            50,  // Example aquifer thickness
+            0.05 // Example specific yield
+        );
+
         return {
             potentialMap: weightedSum,
             precipitationAnalysis,
+            waterAvailability
         };
     }
 
@@ -179,6 +205,64 @@ class BoreholeSiteService {
             slope: ee.Terrain.slope(ee.Image('USGS/SRTMGL1_003')),
             bbox: polygon.bounds().getInfo().coordinates[0]
         };
+    }
+
+    static findFeaturesAtPoint(lat, lng, geoJsonData) {
+        const features = [];
+
+        // Helper function to check if a point is inside a polygon
+        function isPointInPolygon(point, polygon) {
+            const x = point.lng; // Longitude
+            const y = point.lat; // Latitude
+            let inside = false;
+
+            for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                const [xi, yi] = polygon[i]; // Corrected: Use [longitude, latitude]
+                const [xj, yj] = polygon[j];
+
+                const intersect = ((yi > y) !== (yj > y)) &&
+                    (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+
+                if (intersect) inside = !inside;
+            }
+            return inside;
+        }
+
+        // Check if a point is inside a MultiPolygon (handles holes)
+        function isInMultiPolygon(point, multiPolygon) {
+            for (const polygon of multiPolygon) {
+                const exterior = polygon[0]; // Outer boundary
+                const interiors = polygon.slice(1); // Holes
+
+                if (!isPointInPolygon(point, exterior)) continue;
+
+                // Ensure the point is not inside a hole
+                for (const interior of interiors) {
+                    if (isPointInPolygon(point, interior)) return false;
+                }
+
+                return true;
+            }
+            return false;
+        }
+
+        const point = { lat, lng };
+
+        for (const feature of geoJsonData.features) {
+            const { type, coordinates } = feature.geometry;
+
+            if (type === 'Polygon') {
+                if (isInMultiPolygon(point, [coordinates])) {
+                    features.push(feature);
+                }
+            } else if (type === 'MultiPolygon') {
+                if (isInMultiPolygon(point, coordinates)) {
+                    features.push(feature);
+                }
+            }
+        }
+
+        return features;
     }
 
     static async estimateBoreholeDepth(polygon, precipitationAnalysis) {
@@ -819,30 +903,26 @@ class BoreholeSiteService {
         return newWeights;
     }
 
+    // Class-level cache for geology scores
+    static geologyScoreCache = new Map();
+
     /**
-     * Calculates the success probability for a given set of statistics, geological formations, and precipitation analysis.
-     *
-     * @param {Object} stats - An object containing various statistics related to the borehole site.
-     * @param {Object} [geologicalFormations=null] - An optional object containing information about the geological formations.
-     * @param {Object} precipitationAnalysis - An object containing precipitation analysis data.
-     * @returns {number} The calculated success probability, between 0 and 100.
+     * Calculates the success probability for borehole drilling at the given location.
+     * @param {Object} stats - Statistics about the location.
+     * @param {Object|null} geologicalFormations - Geological formation data (optional).
+     * @param {Object} precipitationAnalysis - Precipitation analysis data.
+     * @returns {number} Success probability as a percentage (0-100), where:
+     *   - 0-30: Low probability of success
+     *   - 31-60: Moderate probability of success
+     *   - 61-100: High probability of success
      */
     static async calculateSuccessProbability(stats, geologicalFormations = null, precipitationAnalysis) {
-        let coordinates;
-        if (stats.area && stats.area.coordinates_ && Array.isArray(stats.area.coordinates_) && stats.area.coordinates_[0].length > 0) {
-            try {
-                const polygon = turf.polygon(stats.area.coordinates_);
-                const centroid = turf.centroid(polygon);
-                coordinates = centroid.geometry.coordinates;
-            } catch (error) {
-                logger.error("Error calculating centroid:", error);
-                return 50; // Return default probability if centroid calculation fails
-            }
-        } else {
+        // Extract coordinates using the helper method
+        const coordinates = this.extractCentroidCoordinates(stats);
+        if (!coordinates) {
             logger.warn('Missing or invalid coordinates for probability calculation');
             return 50; // Return default probability if coordinates are missing or invalid
         }
-
 
         const [lon, lat] = coordinates;
 
@@ -855,8 +935,23 @@ class BoreholeSiteService {
         };
 
         try {
-            const geologyScore = await this.calculateGeologyScore(lat, lon);
-            const precipScore = precipitationAnalysis.reliabilityScores.overall;
+            // Check cache for geology score
+            const cacheKey = `${lat.toFixed(4)},${lon.toFixed(4)}`;
+            let geologyScore;
+
+            if (this.geologyScoreCache.has(cacheKey)) {
+                geologyScore = this.geologyScoreCache.get(cacheKey);
+            } else {
+                geologyScore = await this.calculateGeologyScore(lat, lon);
+                this.geologyScoreCache.set(cacheKey, geologyScore);
+            }
+
+            // Validate precipitation analysis data
+            const precipScore = precipitationAnalysis &&
+                precipitationAnalysis.reliabilityScores &&
+                typeof precipitationAnalysis.reliabilityScores.overall === 'number'
+                ? precipitationAnalysis.reliabilityScores.overall
+                : 0.5; // Default value if data is missing
 
             // Calculate weighted score (refactored for clarity)
             let probability = 0;
@@ -872,9 +967,45 @@ class BoreholeSiteService {
 
         } catch (error) {
             logger.error('Error calculating success probability:', error);
-            return 50; // Return default probability on error
+
+            // More granular error handling
+            if (error.message.includes('network') || error.code === 'ECONNREFUSED') {
+                logger.warn('Network error during probability calculation');
+                return 45; // Slightly lower confidence for network issues
+            } else if (error.message.includes('geology') || error.message.includes('lithological')) {
+                logger.warn('Geology data error during probability calculation');
+                return 40; // Lower confidence for geology data issues
+            } else if (error.message.includes('precipitation')) {
+                logger.warn('Precipitation data error during probability calculation');
+                return 42; // Specific value for precipitation data issues
+            }
+
+            return 50; // Default probability on other errors
         }
     }
+
+    /**
+     * Extracts centroid coordinates from the stats object.
+     * @param {Object} stats - The stats object containing area information.
+     * @returns {Array|null} - An array of [longitude, latitude] or null if extraction fails.
+     */
+    static extractCentroidCoordinates(stats) {
+        if (!stats.area || !stats.area.coordinates_ ||
+            !Array.isArray(stats.area.coordinates_) ||
+            stats.area.coordinates_[0].length === 0) {
+            return null;
+        }
+
+        try {
+            const polygon = turf.polygon(stats.area.coordinates_);
+            const centroid = turf.centroid(polygon);
+            return centroid.geometry.coordinates;
+        } catch (error) {
+            logger.error("Error calculating centroid:", error);
+            return null;
+        }
+    }
+
 
     /**
      * Estimates the water table depth for a given polygon.
@@ -1418,6 +1549,169 @@ class BoreholeSiteService {
 
         // Lower slope is better for groundwater retention (normalized to 0-1 range)
         return Math.max(0, 1 - (averageSlope / 45)); // Assume 45 degrees is the upper limit
+    }
+
+    /**
+     * Estimates the total amount of water available in a given area.
+     *
+     * @param {ee.Geometry} polygon - The area of interest.
+     * @param {Object} precipitationAnalysis - The analysis of precipitation data.
+     * @param {number} soilPorosity - The soil porosity (a value between 0 and 1, indicating the fraction of soil volume that is pore space).
+     * @param {number} aquiferThickness - The thickness of the aquifer in meters.
+     * @param {number} specificYield - The specific yield of the aquifer (a value between 0 and 1, indicating the amount of water that can be drained by gravity).
+     * @returns {Object} - An object containing the estimated total water available, including surface water, groundwater, and soil moisture.
+     */
+    static async estimateTotalWaterAvailability(polygon, precipitationAnalysis, soilPorosity = 0.4, aquiferThickness = 50, specificYield = 0.05) {
+        try {
+            // 1. Surface Water Estimation
+            const surfaceWaterEstimation = await this.estimateSurfaceWater(polygon, precipitationAnalysis);
+
+            // 2. Groundwater Estimation
+            const groundwaterEstimation = await this.estimateGroundwater(polygon, precipitationAnalysis, aquiferThickness, specificYield);
+
+            // 3. Soil Moisture Estimation
+            const soilMoistureEstimation = await this.estimateSoilMoisture(polygon, soilPorosity);
+
+            // Total Water Calculation
+            const totalWaterAvailable = {
+                surfaceWater: surfaceWaterEstimation,
+                groundwater: groundwaterEstimation,
+                soilMoisture: soilMoistureEstimation,
+                units: 'cubic meters'  // Indicating units for clarity
+            };
+
+            // Structured logging for better monitoring
+            logger.info('Total Water Availability Estimated:', totalWaterAvailable);
+
+            return totalWaterAvailable;
+        } catch (error) {
+            logger.error('Error estimating total water availability:', error);
+            throw new Error(`Failed to estimate total water availability: ${error.message}`);
+        }
+    }
+
+    /**
+     * Estimates the amount of surface water in a given area based on precipitation data.
+     * @param {ee.Geometry} polygon - The area of interest.
+     * @param {Object} precipitationAnalysis - The analysis of precipitation data.
+     * @returns {number} - The estimated amount of surface water in cubic meters.
+     */
+    static async estimateSurfaceWater(polygon, precipitationAnalysis) {
+        try {
+            // Validate inputs
+            if (!polygon) throw new Error('Polygon is required');
+            if (!precipitationAnalysis) throw new Error('Precipitation analysis is required');
+
+            // Extract relevant data from precipitation analysis
+            const { annualMetrics } = precipitationAnalysis;
+
+            // Check if annualMetrics is available
+            if (!annualMetrics || annualMetrics.length === 0) {
+                logger.warn('No annual metrics available for surface water estimation');
+                return 0;
+            }
+
+            // Calculate average annual rainfall in meters
+            const averageAnnualRainfall = annualMetrics.reduce((sum, metric) => sum + metric.totalRainfall, 0) / annualMetrics.length / 1000; // Convert mm to meters
+
+            // Calculate the area of the polygon in square meters
+            const areaSqM = polygon.area().getInfo();
+
+            // Estimate surface water volume based on rainfall and area
+            const runoffCoefficient = 0.3; // Assume 30% runoff (adjust based on land cover)
+            const surfaceWaterVolume = averageAnnualRainfall * areaSqM * runoffCoefficient;
+
+            logger.info('Surface water volume estimated:', {
+                volume: surfaceWaterVolume,
+                area: areaSqM,
+                rainfall: averageAnnualRainfall
+            });
+
+            return surfaceWaterVolume;
+        } catch (error) {
+            logger.error('Error estimating surface water:', error);
+            throw new Error(`Failed to estimate surface water: ${error.message}`);
+        }
+    }
+
+    /**
+     * Estimates the amount of groundwater in a given area.
+     * @param {ee.Geometry} polygon - The area of interest.
+     * @param {Object} precipitationAnalysis - The analysis of precipitation data.
+     * @param {number} aquiferThickness - The thickness of the aquifer in meters.
+     * @param {number} specificYield - The specific yield of the aquifer (a value between 0 and 1).
+     * @returns {number} - The estimated amount of groundwater in cubic meters.
+     */
+    static async estimateGroundwater(polygon, precipitationAnalysis, aquiferThickness, specificYield) {
+        try {
+            // Validate inputs
+            if (!polygon) throw new Error('Polygon is required');
+            if (!precipitationAnalysis) throw new Error('Precipitation analysis is required');
+            if (aquiferThickness <= 0) throw new Error('Aquifer thickness must be greater than 0');
+            if (specificYield <= 0 || specificYield >= 1) throw new Error('Specific yield must be between 0 and 1');
+
+            // Extract relevant data from precipitation analysis
+            const { rechargePatterns } = precipitationAnalysis;
+
+            // Check if rechargePatterns is available
+            if (!rechargePatterns || !rechargePatterns.totalRechargeEvents) {
+                logger.warn('No recharge patterns available for groundwater estimation');
+                return 0;
+            }
+
+            // Get the area of the polygon in square meters
+            const areaSqM = polygon.area().getInfo();
+
+            // Estimate groundwater recharge volume (in cubic meters)
+            const rechargeVolume = rechargePatterns.totalRechargeEvents * aquiferThickness * specificYield * areaSqM;
+
+            logger.info('Groundwater volume estimated:', {
+                volume: rechargeVolume,
+                area: areaSqM,
+                aquiferThickness,
+                specificYield
+            });
+
+            return rechargeVolume;
+        } catch (error) {
+            logger.error('Error estimating groundwater:', error);
+            throw new Error(`Failed to estimate groundwater: ${error.message}`);
+        }
+    }
+
+    /**
+     * Estimates the amount of soil moisture in a given area.
+     * @param {ee.Geometry} polygon - The area of interest.
+     * @param {number} soilPorosity - The soil porosity (a value between 0 and 1).
+     * @returns {number} - The estimated amount of soil moisture in cubic meters.
+     */
+    static async estimateSoilMoisture(polygon, soilPorosity) {
+        try {
+            // Validate inputs
+            if (!polygon) throw new Error('Polygon is required');
+            if (soilPorosity <= 0 || soilPorosity >= 1) throw new Error('Soil porosity must be between 0 and 1');
+
+            // Get the area of the polygon in square meters
+            const areaSqM = polygon.area().getInfo();
+
+            // Assume a soil depth of 1 meter for this estimation
+            const soilDepth = 1; // meters
+
+            // Estimate soil moisture volume (in cubic meters)
+            const soilMoistureVolume = areaSqM * soilDepth * soilPorosity;
+
+            logger.info('Soil moisture volume estimated:', {
+                volume: soilMoistureVolume,
+                area: areaSqM,
+                soilDepth,
+                soilPorosity
+            });
+
+            return soilMoistureVolume;
+        } catch (error) {
+            logger.error('Error estimating soil moisture:', error);
+            throw new Error(`Failed to estimate soil moisture: ${error.message}`);
+        }
     }
 
 }
