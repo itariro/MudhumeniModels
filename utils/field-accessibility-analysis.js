@@ -67,23 +67,6 @@ class FarmRouteAnalyzer {
         };
     }
 
-    // TODO: DEPRECATED: This method is not used anymore
-    // async analyzeRouteQuality(start, end) {
-    //     this.validateCoordinates(start, end);
-    //     const cacheKey = this.generateCacheKey(start, end);
-
-    //     try {
-    //         const routeData = await this.fetchRouteData(start, end);
-    //         if (!this.validateApiResponse(routeData, 'ors')) {
-    //             throw new Error('Invalid route data format');
-    //         }
-    //         const analysis = await this.processRouteData(routeData);
-    //         const enhancedAnalysis = await this.enhanceWithHazards(analysis);
-    //         return this.formatResults(enhancedAnalysis, routeData);
-    //     } catch (error) {
-    //         this.handleError(error, 'Route analysis failed');
-    //     }
-    // }
 
     async fetchWithRetry(fetchFn, cacheKey, maxRetries = 3, delay = 1000) {
         if (this.overpassCache.has(cacheKey)) {
@@ -107,72 +90,6 @@ class FarmRouteAnalyzer {
 
                 throw error
             }
-        }
-    }
-
-    async fetchRouteData(start, end) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), this.orsConfig.timeout);
-
-        try {
-            const response = await axios({
-                method: 'post',
-                url: this.orsConfig.url,
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': this.orsConfig.apiKey
-                },
-                data: {
-                    coordinates: [
-                        [start.lon, start.lat],
-                        [end.lon, end.lat]
-                    ],
-                    extra_info: ['waytype', 'steepness', 'surface']
-                },
-                signal: controller.signal
-            });
-
-            clearTimeout(timeoutId);
-            return response.data;
-        } catch (error) {
-            clearTimeout(timeoutId);
-            throw this.enhanceError(error, 'Route data fetch failed');
-        }
-    }
-
-    async processRouteData(routeData) {
-        const feature = routeData.features[0];
-        const coords = feature.geometry.coordinates;
-        const totalDistance = feature.properties.summary?.distance || this.computeTotalDistance(coords);
-
-        const waytypeGroups = this.extractWaytypeGroups(feature);
-        const segments = this.analyzeSegments(waytypeGroups, coords, totalDistance);
-
-        return {
-            segments,
-            worstRoad: this.determineWorstRoad(segments),
-            geometry: turf.lineString(coords),
-            totalDistance
-        };
-    }
-    //#endregion
-
-    //#region Analysis Enhancements
-    async enhanceWithHazards(analysis) {
-        try {
-            const hazardLine = await this.createHazardLineString(analysis.segments, analysis.geometry);
-            const hazards = await this.queryHazards(hazardLine);
-            return {
-                ...analysis,
-                hazards: {
-                    bridges: hazards.bridges,
-                    waterCrossings: hazards.water,
-                    compositeRisk: this.calculateCompositeRisk(hazards)
-                }
-            };
-        } catch (error) {
-            console.warn('Hazard analysis partial failure:', error);
-            return analysis; // Return basic analysis
         }
     }
 
@@ -379,91 +296,6 @@ class FarmRouteAnalyzer {
         validate(start, 'start');
     }
 
-    extractWaytypeGroups(feature) {
-        const fallbackGroup = [{
-            start_index: 0,
-            end_index: feature.geometry.coordinates.length - 1,
-            value: 'unclassified'
-        }];
-
-        return feature.properties.extra_info?.waytype?.groups || fallbackGroup;
-    }
-
-    analyzeSegments(groups, coords, totalDistance) {
-        return groups.map(group => {
-            const segmentCoords = coords.slice(group.start_index, group.end_index + 1);
-            const length = this.computeSegmentLength(this.convertToCoordinates(segmentCoords.join(',')));
-            return {
-                roadType: group.value,
-                length,
-                percentage: (length / totalDistance) * 100,
-                ranking: this.roadMetrics.ranking[group.value] || this.roadMetrics.ranking.default,
-                weight: this.roadMetrics.weights[group.value] || this.roadMetrics.weights.default,
-                coordinates: segmentCoords
-            };
-        });
-    }
-
-    computeSegmentLength(coords) {
-        if (!Array.isArray(coords) || coords.length < 2) {
-            throw new Error('Invalid coordinates: Array must contain at least 2 coordinate pairs');
-        }
-
-        try {
-            return coords.slice(1).reduce((total, [lon, lat], i) => {
-                if (!Array.isArray(coords[i]) || coords[i].length !== 2 ||
-                    typeof lon !== 'number' || typeof lat !== 'number' ||
-                    isNaN(lon) || isNaN(lat)) {
-                    throw new Error(`Invalid coordinate pair at index ${i}`);
-                }
-
-                const [prevLon, prevLat] = coords[i];
-                if (typeof prevLon !== 'number' || typeof prevLat !== 'number' ||
-                    isNaN(prevLon) || isNaN(prevLat)) {
-                    throw new Error(`Invalid previous coordinate pair at index ${i}`);
-                }
-
-                return total + this.haversineDistance(prevLat, prevLon, lat, lon);
-            }, 0);
-        } catch (error) {
-            throw new Error(`Failed to compute segment length: ${error.message}`);
-        }
-    }
-
-    convertToCoordinates(data) {
-        // Split the data into an array of strings
-        const dataArray = data.split(',');
-
-        // Initialize an empty array to hold the coordinates
-        const coordinates = [];
-
-        // Iterate over the data array in steps of 2 (since longitude and latitude come in pairs)
-        for (let i = 1; i < dataArray.length; i += 2) {
-            const longitude = parseFloat(dataArray[i]);
-            const latitude = parseFloat(dataArray[i + 1]);
-
-            // Check if both longitude and latitude are valid numbers
-            if (!isNaN(longitude) && !isNaN(latitude)) {
-                coordinates.push([longitude, latitude]);
-            }
-        }
-
-        return coordinates;
-    }
-
-    determineWorstRoad(segments) {
-        return segments.reduce((worst, current) => {
-            const currentScore = current.ranking * current.weight;
-            const worstScore = worst.ranking * worst.weight;
-
-            if (currentScore === worstScore) {
-                return current.length > worst.length ? current : worst; // Stable sorting
-            }
-
-            return currentScore > worstScore ? current : worst;
-        }, { ranking: -Infinity, weight: 1, length: 0 });
-    }
-
     //#region Hazard Analysis
     processBridgeElements(data) {
         return data.elements?.filter(el =>
@@ -498,38 +330,6 @@ class FarmRouteAnalyzer {
         return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     }
 
-    computeTotalDistance(coords) {
-        return coords.slice(1).reduce((total, [lon, lat], i) => {
-            const [prevLon, prevLat] = coords[i];
-            return total + this.haversineDistance(prevLat, prevLon, lat, lon);
-        }, 0);
-    }
-
-    formatResults(analysis, rawData) {
-        return {
-            segments: analysis.segments.map(seg => ({
-                roadType: seg.roadType,
-                length: seg.length,
-                percentage: seg.percentage,
-                qualityScore: (1 - (seg.ranking / 10)) ** 2 * seg.weight * seg.percentage
-            })),
-            overallQuality: analysis.segments.reduce((sum, seg) =>
-                sum + (1 - (seg.ranking / 10)) ** 2 * seg.weight * seg.percentage, 0),
-            riskAssessment: {
-                worstRoadType: analysis.worstRoad.roadType,
-                hazardRisk: analysis.hazards?.compositeRisk || 0, // Safe access in case of errors
-                bridges: analysis.hazards?.bridges?.length || 0,
-                waterCrossings: analysis.hazards?.water?.length || 0,
-                landslides: analysis.hazards?.landslides?.length || 0
-            },
-            metadata: {
-                distance: analysis.totalDistance,
-                coordinates: analysis.geometry.geometry.coordinates
-            },
-            rawData
-        };
-    }
-
     enhanceError(error, context) {
         return Object.assign(new Error(`${context}: ${error.message}`), { original: error });
     }
@@ -541,24 +341,24 @@ class FarmRouteAnalyzer {
 
     async analyzeFieldAccessibility(coordinates) {
         console.log(`Analyzing field accessibility for coordinates: ${JSON.stringify(coordinates)}`);
-        
+
         try {
             // Get basic distance metrics
             console.log("Calculating accessibility metrics...");
             const accessibilityMetrics = await this.calculateAccessibilityMetrics(coordinates);
             console.log("Accessibility metrics:", JSON.stringify(accessibilityMetrics));
-            
+
             // Calculate hazards for each road type
             console.log("Calculating hazards...");
             const hazards = await this.calculateHazardsForRoads(coordinates, accessibilityMetrics);
             console.log("Hazards:", JSON.stringify(hazards));
-            
+
             const result = {
                 metrics: accessibilityMetrics,
                 hazards: hazards,
                 overall_accessibility_score: this.calculateOverallAccessibilityScore(accessibilityMetrics, hazards)
             };
-            
+
             console.log("Analysis complete:", JSON.stringify(result));
             return result;
         } catch (error) {
@@ -566,7 +366,7 @@ class FarmRouteAnalyzer {
             throw error;
         }
     }
-    
+
     async calculateHazardsForRoads(coordinates, metrics) {
         // We can reuse the existing hazard analysis logic but apply it to each road type
         // This is a simplified version - you'd need to expand this
@@ -803,7 +603,10 @@ class FarmRouteAnalyzer {
 
                 distance_to_town: adminTown ?
                     this.calculatePointDistance(coordinates, adminTown) :
-                    (nearestTown ? this.calculatePointDistance(coordinates, nearestTown) : -1)
+                    (nearestTown ? this.calculatePointDistance(coordinates, nearestTown) : -1),
+
+                capitalCity,
+                nearestTown
             };
         } catch (error) {
             console.error("Population distance calculation failed:", error);

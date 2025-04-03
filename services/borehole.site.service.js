@@ -7,7 +7,6 @@ const openmeteo = require('openmeteo');
 
 const AgriculturalLandAnalyzer = require('../utils/elevation-analysis');
 const FarmRouteAnalyzer = require('../utils/field-accessibility-analysis');
-const locationsZimbabwe = require('../data/zw.json');
 const hydroGeologicalMapZimbabwe = require('../data/hydrogeological_map_zimbabwe.json');
 const { environment } = require('../config/config');
 
@@ -77,32 +76,7 @@ class BoreholeSiteService {
             const fieldPotentialAnalysis = []; // await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
 
             let AccessibilityAnalysis = [];
-            console.log('locationsZimbabwe -> ', locationsZimbabwe);
             try {
-                // TODO: disabled for testing
-                // const analyzer = new FarmRouteAnalyzer();
-                // await Promise.all(locationsZimbabwe.map(async (location) => {
-                //     const routeAnalysis = await analyzer.analyzeRouteQuality(
-                //         { lat, lon }, // field location
-                //         { lat: parseFloat(location.lat), lon: parseFloat(location.lng) }
-                //     );
-
-                //     return {
-                //         location: location.city,
-                //         admin: location.admin_name,
-                //         distance: Number(routeAnalysis.metadata.distance).toFixed(0),
-                //         overallQuality: (routeAnalysis.overallQuality / 100).toFixed(1),
-                //         riskAssessment: {
-                //             worstRoadType: routeAnalysis.riskAssessment.worstRoadType,
-                //             hazardRisk: Number(routeAnalysis.riskAssessment.hazardRisk).toFixed(2),
-                //             bridges: routeAnalysis.riskAssessment.bridges,
-                //             waterCrossings: routeAnalysis.riskAssessment.waterCrossings
-                //         },
-                //         unabridged: routeAnalysis.analysis
-                //     };
-                // })).then(results => {
-                //     AccessibilityAnalysis = results;
-                // });
                 const analyzer = new FarmRouteAnalyzer();
                 AccessibilityAnalysis = await analyzer.analyzeFieldAccessibility({ lat, lon });
             } catch (error) {
@@ -161,7 +135,12 @@ class BoreholeSiteService {
 
         const bbox = polygon.bounds().getInfo().coordinates[0];
         const slope = ee.Terrain.slope(elevation);
-        this.FIELD_SLOPE = slope;
+        const slopeValue = slope.reduceRegion({
+            reducer: ee.Reducer.mean(),
+            geometry: polygon,
+            scale: 30
+        }).get('slope').getInfo();
+        this.FIELD_SLOPE = slopeValue;
 
         const precipitationAnalysis = await this.analyzePrecipitation(lat, lon);
         const weights = this.calculateDynamicWeights(precipitationAnalysis);
@@ -310,8 +289,9 @@ class BoreholeSiteService {
 
     static async analyzePrecipitation(lat, lon) {
         try {
+            // In analyzePrecipitation method
             const startDate = new Date();
-            startDate.setFullYear(startDate.getFullYear() - 5);
+            startDate.setFullYear(startDate.getFullYear() - 10); // Increase from 5 to 10 years
 
             const params = {
                 latitude: lat,
@@ -749,7 +729,10 @@ class BoreholeSiteService {
         const monthlyRainfall = Object.values(monthlyAverages);
         const avg = this.average(monthlyRainfall);
         const stdDev = Math.sqrt(monthlyRainfall.reduce((sum, val) => sum + Math.pow(val - avg, 2), 0) / monthlyRainfall.length);
-        return avg + (stdDev * 1.5); // Adjust multiplier based on local conditions
+
+        // Use a more reasonable threshold with a minimum value
+        const calculatedThreshold = avg + (stdDev * 0.8);
+        return Math.min(calculatedThreshold, 50); // Cap at 50mm to avoid unrealistic thresholds
     }
 
     /**
@@ -763,10 +746,28 @@ class BoreholeSiteService {
      * identifyRechargeEvents([{dt: 1623456789, rain: 25}], 20, 0.6, 8)
      * // Returns: [{date: Date, amount: 25}]
      */
-    static identifyRechargeEvents(precipData, rechargeThreshold, slope) {
+    static async identifyRechargeEvents(precipData, rechargeThreshold, slope) {
+
+        console.log('precipData sample:', precipData.slice(0, 5));
+        console.log('rechargeThreshold:', rechargeThreshold);
+        console.log('slope:', slope);
+
+
+        // Check if there's any rainfall data
+        const hasRainfall = precipData.some(record => record.rain > 0);
+        if (!hasRainfall) {
+            logger.warn('No rainfall detected in precipitation data');
+            return [];
+        }
+
+        // Convert slope to number if it's an EE object
+        const slopeValue = typeof slope === 'number' ? slope : 5; // Default to 5 if not a number
+
         return precipData.filter(record => {
-            const soilFactor = record.soilMoisture > RechargeConstants.SOIL_MOISTURE_THRESHOLD ? RechargeConstants.SOIL_FACTOR_HIGH : RechargeConstants.SOIL_FACTOR_LOW;
-            const slopeFactor = slope < RechargeConstants.SLOPE_THRESHOLD ? RechargeConstants.SLOPE_FACTOR_LOW : RechargeConstants.SLOPE_FACTOR_HIGH;
+            const soilFactor = record.soilMoisture > RechargeConstants.SOIL_MOISTURE_THRESHOLD ?
+                RechargeConstants.SOIL_FACTOR_HIGH : RechargeConstants.SOIL_FACTOR_LOW;
+            const slopeFactor = slopeValue < RechargeConstants.SLOPE_THRESHOLD ?
+                RechargeConstants.SLOPE_FACTOR_LOW : RechargeConstants.SLOPE_FACTOR_HIGH;
             return record.rain > (rechargeThreshold * soilFactor * slopeFactor);
         }).map(record => ({
             date: new Date(record.dt),
@@ -802,6 +803,13 @@ class BoreholeSiteService {
      * calculateRechargeEfficiency([{dt: 123, rain: 15}], {'0': 10}, 12)
      */
     static calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold) {
+        // Check if there's any rainfall
+        const hasRainfall = precipData.some(record => record.rain > 0);
+        if (!hasRainfall) {
+            logger.warn('No rainfall detected, returning minimum efficiency');
+            return 0.01; // Return a small non-zero value instead of 0
+        }
+
         let totalRecharge = 0;
         let totalRainfall = 0;
 
@@ -812,7 +820,7 @@ class BoreholeSiteService {
             }
         });
 
-        return totalRainfall === 0 ? 0 : totalRecharge / totalRainfall;
+        return totalRainfall === 0 ? 0.01 : totalRecharge / totalRainfall;
     }
 
     static calculateReliabilityScores(metrics) {
