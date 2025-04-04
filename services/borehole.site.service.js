@@ -358,7 +358,6 @@ class BoreholeSiteService {
         }
     }
 
-
     /**
      * Calculates advanced precipitation metrics from the provided precipitation data.
      *

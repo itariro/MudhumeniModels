@@ -29,6 +29,7 @@ class FarmRouteAnalyzer {
         this.rateLimit = parseInt(process.env.RATE_LIMIT) || 5; // Requests per second
         this.lastRequest = 0;
         this.RATE_LIMIT_INTERVAL = 5000; // 5 seconds between requests
+        this.routeCache = new LRUCache({ max: 50 }); // Cache for routes
     }
 
     initRoadMetrics() {
@@ -67,16 +68,23 @@ class FarmRouteAnalyzer {
         };
     }
 
+    /**
+     * Analyzes the accessibility of a field based on its geographical coordinates.
+     * 
+     * @param {Object} coordinates - The geographical coordinates to analyze.
+     * @returns {Promise<Object>} An object containing accessibility metrics, hazards, and an overall accessibility score.
+     * @throws {Error} Throws an error if the accessibility analysis fails.
+     */
     async analyzeFieldAccessibility(coordinates) {
         console.log(`Analyzing field accessibility for coordinates: ${JSON.stringify(coordinates)}`);
 
         try {
-            // Get basic distance metrics
+            // Get basic distance metrics and route information
             console.log("Calculating accessibility metrics...");
             const accessibilityMetrics = await this.calculateAccessibilityMetrics(coordinates);
 
-            // Calculate hazards for each road type
-            console.log("Calculating hazards...");
+            // Calculate hazards using the new route-based approach
+            console.log("Calculating hazards along critical routes...");
             const hazards = await this.calculateHazardsForRoads(coordinates, accessibilityMetrics);
 
             const result = {
@@ -84,12 +92,56 @@ class FarmRouteAnalyzer {
                 hazards: hazards,
                 overall_accessibility_score: this.calculateOverallAccessibilityScore(accessibilityMetrics, hazards)
             };
+
+            // Add a summary of the critical segment for quick reference
+            if (hazards.critical_segment) {
+                result.critical_segment_summary = {
+                    distance_to_primary_road: accessibilityMetrics.distance_to_primary,
+                    hazards_count: hazards.critical_segment.bridges +
+                        hazards.critical_segment.water_crossings +
+                        hazards.critical_segment.landslides,
+                    risk_level: this.getRiskLevel(hazards.critical_segment.risk_score)
+                };
+            }
+
             console.log("Field accessibility analysis completed successfully.");
             return result;
         } catch (error) {
             console.error("Field accessibility analysis failed:", error);
             throw error;
         }
+    }
+
+    /**
+     * Determines the risk level based on a numerical risk score.
+     * 
+     * @param {number} riskScore - A numerical score between 0 and 1 representing risk level.
+     * @returns {string} The risk level categorization: "Low", "Medium", "High", or "Very High".
+     */
+    getRiskLevel(riskScore) {
+        if (riskScore < 0.2) return "Low";
+        if (riskScore < 0.5) return "Medium";
+        if (riskScore < 0.8) return "High";
+        return "Very High";
+    }
+
+    /**
+     * Calculates a route between two coordinates with caching to improve performance.
+     * 
+     * @param {Object} startCoord - The starting coordinate with latitude and longitude.
+     * @param {Object} endCoord - The ending coordinate with latitude and longitude.
+     * @returns {Promise<Object>} A cached or newly calculated route between the coordinates.
+     */
+    async calculateRealRouteWithCache(startCoord, endCoord) {
+        const cacheKey = `route_${startCoord.lat.toFixed(6)}_${startCoord.lon.toFixed(6)}_${endCoord.lat.toFixed(6)}_${endCoord.lon.toFixed(6)}`;
+
+        if (this.routeCache.has(cacheKey)) {
+            return this.routeCache.get(cacheKey);
+        }
+
+        const route = await this.calculateRealRoute(startCoord, endCoord);
+        this.routeCache.set(cacheKey, route);
+        return route;
     }
 
     async fetchWithRetry(fetchFn, cacheKey, maxRetries = 3, delay = 1000) {
@@ -253,10 +305,6 @@ class FarmRouteAnalyzer {
         this.lastRequest = Date.now();
     }
 
-    truncateCoordinate(coord) {
-        return parseFloat(coord.toFixed(6));
-    }
-
     hashGeometry(geometry) {
         return turf.centroid(geometry).geometry.coordinates
             .map(c => c.toFixed(6)).join('-');
@@ -329,62 +377,6 @@ class FarmRouteAnalyzer {
         throw this.enhanceError(error, context);
     }
 
-    async calculateHazardsForRoads(coordinates, metrics) {
-        // We can reuse the existing hazard analysis logic but apply it to each road type
-        // This is a simplified version - you'd need to expand this
-        const hazards = {};
-
-        // For each road type, calculate hazards along the route to that road
-        for (const roadType of ['primary', 'secondary', 'tertiary', 'city', 'town']) {
-            if (metrics[`distance_to_${roadType}`] > 0) {
-                // Create a simple line from coordinates to nearest point of this type
-                // This is simplified - you'd need actual route geometry
-                const lineString = this.createSimpleLineString(coordinates, roadType, metrics);
-
-                // Use existing hazard analysis
-                const hazardAnalysis = await this.queryHazards(lineString);
-
-                hazards[roadType] = {
-                    bridges: hazardAnalysis.bridges.length,
-                    water_crossings: hazardAnalysis.water.length,
-                    landslides: hazardAnalysis.landslides.length,
-                    risk_score: this.calculateCompositeRisk(hazardAnalysis)
-                };
-            } else {
-                hazards[roadType] = { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 };
-            }
-        }
-
-        return hazards;
-    }
-
-    calculateOverallAccessibilityScore(metrics, hazards) {
-        // Calculate a weighted score based on distances and hazards
-        // This is a simple example - you'd want to refine this formula
-        let score = 0;
-        const weights = {
-            primary: 0.3,
-            secondary: 0.25,
-            tertiary: 0.2,
-            city: 0.15,
-            town: 0.1
-        };
-
-        for (const type in weights) {
-            const distance = metrics[`distance_to_${type}`];
-            if (distance > 0) {
-                // Normalize distance (closer is better)
-                const normalizedDistance = Math.min(1, 10000 / distance);
-                // Factor in hazards
-                const hazardPenalty = hazards[type] ? hazards[type].risk_score : 0;
-
-                score += weights[type] * normalizedDistance * (1 - hazardPenalty);
-            }
-        }
-
-        return score;
-    }
-
     createSimpleLineString(coordinates, roadType, metrics) {
         // This is a placeholder - in reality, you'd need to get the actual coordinates
         // of the nearest road/city/town point
@@ -402,26 +394,6 @@ class FarmRouteAnalyzer {
             [coordinates.lon, coordinates.lat],
             [endLon, endLat]
         ]);
-    }
-
-    async calculateAccessibilityMetrics(coordinates) {
-        try {
-            // Validate input coordinates
-            this.validateCoordinatesRefactored(coordinates);
-
-            // Calculate distances to different road types
-            const roadDistances = await this.calculateRoadDistances(coordinates);
-
-            // Calculate distances to population centers
-            const populationDistances = await this.calculatePopulationDistances(coordinates);
-
-            return {
-                ...roadDistances,
-                ...populationDistances
-            };
-        } catch (error) {
-            this.handleError(error, 'Accessibility metrics calculation failed');
-        }
     }
 
     async calculateRoadDistances(coordinates) {
@@ -655,6 +627,296 @@ class FarmRouteAnalyzer {
             clearTimeout(timeoutId);
             throw this.enhanceError(error, 'Overpass query failed');
         }
+    }
+
+    /**
+     * Calculates comprehensive accessibility metrics for a given geographic location.
+     * 
+     * @param {Object} coordinates - The geographic coordinates to analyze
+     * @param {number} coordinates.lat - Latitude of the location
+     * @param {number} coordinates.lon - Longitude of the location
+     * @returns {Promise<Object>} Accessibility metrics including road distances, population distances, and optional route information
+     * @throws {Error} If accessibility metrics calculation fails
+     */
+    async calculateAccessibilityMetrics(coordinates) {
+        try {
+            // Validate input coordinates
+            this.validateCoordinatesRefactored(coordinates);
+
+            // Calculate distances to different road types
+            const roadDistances = await this.calculateRoadDistances(coordinates);
+
+            // Calculate distances to population centers
+            const populationDistances = await this.calculatePopulationDistances(coordinates);
+
+            // Add route information for the critical segment (field to primary road)
+            const primaryRoadInfo = await this.findNearestPrimaryRoadPoint(coordinates);
+
+            // Only add route data if we found a primary road
+            let routeData = {};
+            if (primaryRoadInfo.point) {
+                const route = await this.calculateRealRouteWithCache(coordinates, primaryRoadInfo.point);
+                routeData = {
+                    primary_road_route: {
+                        distance: primaryRoadInfo.distance,
+                        route_geometry: route.features[0].geometry
+                    }
+                };
+            }
+
+            return {
+                ...roadDistances,
+                ...populationDistances,
+                ...routeData
+            };
+        } catch (error) {
+            this.handleError(error, 'Accessibility metrics calculation failed');
+        }
+    }
+
+    /**
+     * Calculates the shortest route between two geographic coordinates using OpenRouteService.
+     * 
+     * @param {Object} startCoord - The starting coordinate with longitude and latitude
+     * @param {Object} endCoord - The destination coordinate with longitude and latitude
+     * @returns {Promise<Object>} The route data from the OpenRouteService API
+     * @throws {Error} If route calculation fails or returns invalid data
+     */
+    async calculateRealRoute(startCoord, endCoord) {
+        try {
+            await this.rateLimitCheck();
+
+            const response = await axios.post(
+                this.orsConfig.url,
+                {
+                    coordinates: [
+                        [startCoord.lon, startCoord.lat],
+                        [endCoord.lon, endCoord.lat]
+                    ],
+                    preference: "shortest",
+                    instructions: false
+                },
+                {
+                    headers: {
+                        'Authorization': this.orsConfig.apiKey,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: this.orsConfig.timeout
+                }
+            );
+
+            if (!this.validateApiResponse(response.data, 'ors')) {
+                throw new Error('Invalid route data format');
+            }
+
+            return response.data;
+        } catch (error) {
+            throw this.enhanceError(error, 'Route calculation failed');
+        }
+    }
+
+    /**
+     * Finds the nearest point on a primary road to the given coordinates.
+     * 
+     * @param {Object} coordinates - The reference coordinates with latitude and longitude
+     * @returns {Promise<Object>} An object containing the nearest point and its distance from the reference coordinates
+     * @throws {Error} If no primary roads are found within the search radius
+     */
+    async findNearestPrimaryRoadPoint(coordinates) {
+        const query = `
+            [out:json][timeout:60];
+            way["highway"="primary"](around:50000,${coordinates.lat},${coordinates.lon});
+            out geom;
+        `;
+
+        const data = await this.queryOverpass(query);
+
+        if (!data.elements || data.elements.length === 0) {
+            throw new Error('No primary roads found within search radius');
+        }
+
+        let nearestPoint = null;
+        let minDistance = Infinity;
+
+        for (const road of data.elements) {
+            if (road.geometry) {
+                for (const point of road.geometry) {
+                    const distance = this.haversineDistance(
+                        coordinates.lat, coordinates.lon,
+                        point.lat, point.lon
+                    );
+
+                    if (distance < minDistance) {
+                        minDistance = distance;
+                        nearestPoint = { lat: point.lat, lon: point.lon };
+                    }
+                }
+            }
+        }
+
+        return { point: nearestPoint, distance: minDistance };
+    }
+
+    /**
+     * Calculates road hazards for different road types based on field coordinates and road metrics.
+     * 
+     * @param {Object} coordinates - The geographic coordinates of the field
+     * @param {Object} metrics - Road distance metrics for different road types
+     * @returns {Promise<Object>} A comprehensive hazard analysis for primary, secondary, tertiary roads, and city/town segments
+     * @throws {Error} If hazard calculation encounters any issues during processing
+     */
+    async calculateHazardsForRoads(coordinates, metrics) {
+        const hazards = {};
+
+        try {
+            // Find nearest primary road point
+            const primaryRoadInfo = await this.findNearestPrimaryRoadPoint(coordinates);
+
+            if (primaryRoadInfo.point) {
+                // Get actual route from field to primary road
+                const routeToMainRoad = await this.calculateRealRouteWithCache(
+                    coordinates,
+                    primaryRoadInfo.point
+                );
+
+                // Extract route geometry as GeoJSON
+                const routeGeometry = routeToMainRoad.features[0].geometry;
+
+                // Analyze hazards along this critical segment
+                const hazardAnalysis = await this.queryHazards(routeGeometry);
+
+                // Store hazard information for the critical segment
+                hazards.critical_segment = {
+                    distance: primaryRoadInfo.distance,
+                    bridges: hazardAnalysis.bridges.length,
+                    water_crossings: hazardAnalysis.water.length,
+                    landslides: hazardAnalysis.landslides.length,
+                    risk_score: this.calculateCompositeRisk(hazardAnalysis)
+                };
+
+                // For other road types, we'll maintain simplified analysis
+                for (const roadType of ['secondary', 'tertiary']) {
+                    if (metrics[`distance_to_${roadType}`] > 0) {
+                        // Only analyze if this road type is closer than primary
+                        if (metrics[`distance_to_${roadType}`] < primaryRoadInfo.distance) {
+                            const nearestPoint = await this.findNearestRoadPoint(coordinates, roadType);
+                            if (nearestPoint) {
+                                const routeToRoad = await this.calculateRealRouteWithCache(
+                                    coordinates,
+                                    nearestPoint
+                                );
+                                const routeGeom = routeToRoad.features[0].geometry;
+                                const roadHazards = await this.queryHazards(routeGeom);
+
+                                hazards[roadType] = {
+                                    bridges: roadHazards.bridges.length,
+                                    water_crossings: roadHazards.water.length,
+                                    landslides: roadHazards.landslides.length,
+                                    risk_score: this.calculateCompositeRisk(roadHazards)
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
+            // For cities and towns, we'll just use the critical segment hazards
+            // since we're focusing on the field-to-main-road segment
+            hazards.city = hazards.critical_segment;
+            hazards.town = hazards.critical_segment;
+
+            return hazards;
+        } catch (error) {
+            console.error("Error calculating hazards:", error);
+            // Return empty hazard data as fallback
+            return {
+                critical_segment: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
+                secondary: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
+                tertiary: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
+                city: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
+                town: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 }
+            };
+        }
+    }
+
+    /**
+     * Finds the nearest point on a specific road type within a 50km radius of given coordinates.
+     * 
+     * @param {Object} coordinates - The reference coordinates with lat and lon properties
+     * @param {string} roadType - The type of road to search for (e.g., 'secondary', 'tertiary')
+     * @returns {Object|null} The nearest road point with lat and lon, or null if no roads found
+     */
+    async findNearestRoadPoint(coordinates, roadType) {
+        const query = `
+            [out:json][timeout:60];
+            way["highway"="${roadType}"](around:50000,${coordinates.lat},${coordinates.lon});
+            out geom;
+        `;
+
+        const data = await this.queryOverpass(query);
+
+        if (!data.elements || data.elements.length === 0) {
+            return null;
+        }
+
+        let nearestPoint = null;
+        let minDistance = Infinity;
+
+        for (const road of data.elements) {
+            if (road.geometry) {
+                for (const point of road.geometry) {
+                    const distance = this.haversineDistance(
+                        coordinates.lat, coordinates.lon,
+                        point.lat, point.lon
+                    );
+
+                    if (distance < minDistance) {
+                        minDistance = distance;
+                        nearestPoint = { lat: point.lat, lon: point.lon };
+                    }
+                }
+            }
+        }
+
+        return nearestPoint;
+    }
+
+    /**
+     * Calculates an overall accessibility score based on road distances and potential hazards.
+     * 
+     * @param {Object} metrics - Distance metrics to different road types
+     * @param {Object} hazards - Hazard information for critical road segments
+     * @returns {number} A normalized accessibility score between 0 and 1
+     */
+    calculateOverallAccessibilityScore(metrics, hazards) {
+        // Base score on distances
+        let score = 0;
+        const weights = {
+            primary: 0.4,    // Increased weight for primary roads
+            secondary: 0.2,
+            tertiary: 0.15,
+            city: 0.15,
+            town: 0.1
+        };
+
+        for (const type in weights) {
+            const distance = metrics[`distance_to_${type}`];
+            if (distance > 0) {
+                // Normalize distance (closer is better)
+                const normalizedDistance = Math.min(1, 10000 / distance);
+                score += weights[type] * normalizedDistance;
+            }
+        }
+
+        // Apply critical segment hazard penalty
+        // This focuses on the most important part - getting from field to main road
+        if (hazards.critical_segment) {
+            const hazardPenalty = hazards.critical_segment.risk_score;
+            // Reduce score based on hazards, but never below 20% of original
+            score = score * (1 - (hazardPenalty * 0.8));
+        }
+
+        return score;
     }
 }
 
