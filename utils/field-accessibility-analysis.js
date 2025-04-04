@@ -67,6 +67,30 @@ class FarmRouteAnalyzer {
         };
     }
 
+    async analyzeFieldAccessibility(coordinates) {
+        console.log(`Analyzing field accessibility for coordinates: ${JSON.stringify(coordinates)}`);
+
+        try {
+            // Get basic distance metrics
+            console.log("Calculating accessibility metrics...");
+            const accessibilityMetrics = await this.calculateAccessibilityMetrics(coordinates);
+
+            // Calculate hazards for each road type
+            console.log("Calculating hazards...");
+            const hazards = await this.calculateHazardsForRoads(coordinates, accessibilityMetrics);
+
+            const result = {
+                metrics: accessibilityMetrics,
+                hazards: hazards,
+                overall_accessibility_score: this.calculateOverallAccessibilityScore(accessibilityMetrics, hazards)
+            };
+            console.log("Field accessibility analysis completed successfully.");
+            return result;
+        } catch (error) {
+            console.error("Field accessibility analysis failed:", error);
+            throw error;
+        }
+    }
 
     async fetchWithRetry(fetchFn, cacheKey, maxRetries = 3, delay = 1000) {
         if (this.overpassCache.has(cacheKey)) {
@@ -93,7 +117,6 @@ class FarmRouteAnalyzer {
         }
     }
 
-    // Improved spatial query with buffered bounding box
     async buildOverpassQuery(geometry) {
         const buffered = turf.buffer(geometry, 0.02, { units: 'kilometers' });
         const bbox = turf.bbox(buffered);
@@ -192,7 +215,6 @@ class FarmRouteAnalyzer {
         return result;
     }
 
-    // Improved risk calculation with configurable weights
     calculateCompositeRisk(hazards) {
         const bridgeRisk = Math.min(hazards.bridges.length * this.roadMetrics.hazardWeights.bridge, 1);
         const waterRisk = Math.min(hazards.water.length * this.roadMetrics.hazardWeights.water, 1);
@@ -201,34 +223,12 @@ class FarmRouteAnalyzer {
         return (bridgeRisk + waterRisk + landslideRisk) / 3;
     }
 
-    // Memory-optimized coordinate processing
-    createHazardLineString(segments, routeGeometry) {
-        const MAX_POINTS = 1000;
-        const coordinates = [];
-
-        for (const seg of segments) {
-            coordinates.push(...seg.coordinates.map(([lon, lat]) => [
-                this.truncateCoordinate(lon),
-                this.truncateCoordinate(lat)
-            ]));
-
-            if (coordinates.length > MAX_POINTS) {
-                coordinates.length = MAX_POINTS;
-                break;
-            }
-        }
-
-        return coordinates.length > 1 ? turf.lineString(coordinates) : routeGeometry;
-    }
-
-    // New validation system
     validateApiResponse(response, type = 'ors') {
         const ajv = new Ajv({ strict: false });
         const schema = type === 'ors' ? orsSchema : overpassSchema;
         return ajv.validate(schema, response);
     }
 
-    // Rate limiting implementation
     async rateLimitCheck() {
         const now = Date.now();
         this.requestQueue = this.requestQueue.filter(t => t > now - 1000);
@@ -253,7 +253,6 @@ class FarmRouteAnalyzer {
         this.lastRequest = Date.now();
     }
 
-    // Utility improvements
     truncateCoordinate(coord) {
         return parseFloat(coord.toFixed(6));
     }
@@ -263,12 +262,6 @@ class FarmRouteAnalyzer {
             .map(c => c.toFixed(6)).join('-');
     }
 
-    generateCacheKey(start, end) {
-        return [start.lat, start.lon, end.lat, end.lon]
-            .map(c => c.toFixed(6)).join('_');
-    }
-
-    //#region Helper Methods
     validateCoordinates(start, end) {
         const validate = (coord, name) => {
             if (!coord || typeof coord.lat !== 'number' || typeof coord.lon !== 'number') {
@@ -296,7 +289,6 @@ class FarmRouteAnalyzer {
         validate(start, 'start');
     }
 
-    //#region Hazard Analysis
     processBridgeElements(data) {
         return data.elements?.filter(el =>
             el.tags?.bridge === 'yes' &&
@@ -314,9 +306,7 @@ class FarmRouteAnalyzer {
     processLandslideElements(data) {
         return data.elements?.filter(el => el.tags?.natural === 'landslide') || [];
     }
-    //#endregion
 
-    //#region Utilities
     haversineDistance(lat1, lon1, lat2, lon2) {
         const R = 6371e3;
         const φ1 = lat1 * Math.PI / 180;
@@ -337,31 +327,6 @@ class FarmRouteAnalyzer {
     handleError(error, context) {
         console.error(`${context}:`, error);
         throw this.enhanceError(error, context);
-    }
-
-    async analyzeFieldAccessibility(coordinates) {
-        console.log(`Analyzing field accessibility for coordinates: ${JSON.stringify(coordinates)}`);
-
-        try {
-            // Get basic distance metrics
-            console.log("Calculating accessibility metrics...");
-            const accessibilityMetrics = await this.calculateAccessibilityMetrics(coordinates);
-
-            // Calculate hazards for each road type
-            console.log("Calculating hazards...");
-            const hazards = await this.calculateHazardsForRoads(coordinates, accessibilityMetrics);
-
-            const result = {
-                metrics: accessibilityMetrics,
-                hazards: hazards,
-                overall_accessibility_score: this.calculateOverallAccessibilityScore(accessibilityMetrics, hazards)
-            };
-            console.log("Field accessibility analysis completed successfully.");
-            return result;
-        } catch (error) {
-            console.error("Field accessibility analysis failed:", error);
-            throw error;
-        }
     }
 
     async calculateHazardsForRoads(coordinates, metrics) {
@@ -439,7 +404,6 @@ class FarmRouteAnalyzer {
         ]);
     }
 
-    // TODO: new streamlined methods here
     async calculateAccessibilityMetrics(coordinates) {
         try {
             // Validate input coordinates
@@ -547,7 +511,6 @@ class FarmRouteAnalyzer {
         console.log(`Calculated minimum distance: ${minDistance}`);
         return minDistance;
     }
-
 
     async calculatePopulationDistances(coordinates) {
         // First, determine the country based on coordinates
@@ -670,7 +633,6 @@ class FarmRouteAnalyzer {
         }
     }
 
-
     async queryOverpass(query) {
         await this.rateLimitCheck();
 
@@ -694,11 +656,6 @@ class FarmRouteAnalyzer {
             throw this.enhanceError(error, 'Overpass query failed');
         }
     }
-
-
-
-
-
 }
 
 module.exports = FarmRouteAnalyzer;
