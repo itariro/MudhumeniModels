@@ -31,6 +31,7 @@
     "ml-xgboost": "^1.1.2",
     "morgan": "^1.10.0",
     "openmeteo": "^1.2.0",
+    "p-queue": "^8.1.0",
     "patch-package": "^8.0.0",
     "quick-lru": "^7.0.0",
     "uuid": "^11.1.0",
