@@ -131,7 +131,7 @@ class BoreholeSiteService {
         const soilMoisture = ee.ImageCollection('NASA_USDA/HSL/SMAP_soil_moisture').first();
         const temperature = ee.ImageCollection('MODIS/006/MOD11A1').first();
 
-        logger.info('Earth Engine data loaded:', { elevation, landcover, soilMoisture, temperature });
+        logger.info('Earth Engine data loaded...');
 
         const bbox = polygon.bounds().getInfo().coordinates[0];
         const slope = ee.Terrain.slope(elevation);
@@ -145,7 +145,7 @@ class BoreholeSiteService {
         const precipitationAnalysis = await this.analyzePrecipitation(lat, lon);
         const weights = this.calculateDynamicWeights(precipitationAnalysis);
 
-        logger.info('Calculating weights and slope:', { weights, slope });
+        logger.info('Calculating weights and slope...');
 
         const normalizedElevation = elevation.unitScale(0, 3000);
         const normalizedSlope = slope.unitScale(0, 45);
@@ -339,7 +339,7 @@ class BoreholeSiteService {
                 timezone: "GMT"
             };
 
-            logger.info('Fetching historical precipitation data', {
+            logger.info('Fetching historical precipitation data...', {
                 latitude: lat,
                 longitude: lon,
                 startDate: params.start_date,
@@ -360,9 +360,7 @@ class BoreholeSiteService {
             }
 
             const data = response.data;
-            logger.info('Received historical precipitation data', {
-                dataSize: data ? Object.keys(data).length : 0
-            });
+            logger.info('Received historical precipitation data...',);
 
             // Validate hourly data exists
             if (!data.hourly) {
@@ -416,7 +414,7 @@ class BoreholeSiteService {
                 };
             });
 
-            logger.info('Successfully processed precipitation records', {
+            logger.info('Successfully processed precipitation records...', {
                 recordCount: formattedData.length,
                 timeRange: `${new Date(formattedData[0]?.dt).toISOString()} to ${new Date(formattedData[formattedData.length - 1]?.dt).toISOString()}`
             });
@@ -504,7 +502,7 @@ class BoreholeSiteService {
             });
         }
 
-        logger.info('Generated fallback precipitation data', {
+        logger.info('Generated fallback precipitation data...', {
             recordCount: formattedData.length,
             timeRange: `${new Date(formattedData[0]?.dt).toISOString()} to ${new Date(formattedData[formattedData.length - 1]?.dt).toISOString()}`
         });
@@ -860,8 +858,6 @@ class BoreholeSiteService {
             }
 
             logger.info('Analyzing recharge patterns...');
-            logger.info('Precipitation data:', precipData);
-            logger.info('slopeValue:', this.FIELD_SLOPE)
 
             const rechargeThreshold = this.calculateRechargeThreshold(monthlyAverages);
             const [events, annualPattern, efficiency] = await Promise.all([

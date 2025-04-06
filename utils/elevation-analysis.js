@@ -244,7 +244,7 @@ class AgriculturalLandAnalyzer {
      */
     static async analyzeArea(geoJson) {
         try {
-            logger.info('Starting analysis for GeoJSON area');
+            logger.info('Starting analysis for GeoJSON area...');
 
             // Validate GeoJSON input
             if (!this.validateGeoJSON(geoJson)) {
@@ -277,7 +277,7 @@ class AgriculturalLandAnalyzer {
             const analysis = await this.performAnalysis(geoJson, elevationData);
             console.log('Analysis:', analysis);
 
-            logger.info('Analysis completed successfully');
+            logger.info('Analysis completed successfully...');
             return analysis;
         } catch (error) {
             logger.error('Error in area analysis:', error);
@@ -499,7 +499,7 @@ class AgriculturalLandAnalyzer {
         return true;
     }
 
-    
+
     /**
      * Performs comprehensive geospatial and terrain analysis for a given geographic area
      * @param {Object} geoJson - GeoJSON representation of the area to analyze
@@ -521,11 +521,17 @@ class AgriculturalLandAnalyzer {
             }
         }));
 
-        
+        elevationData.forEach(d => {
+            const { coordinates, elevation } = d.value;
+            console.log('Coordinates:', coordinates);
+            console.log('Elevation:', elevation);
+        });
+
+
 
         // Create elevation surface for analysis
         const elevationSurface = turf.tin(turf.featureCollection(points), 'elevation');
-        console.log('Elevation surface:', elevationSurface);
+        console.log('Elevation surface:',  elevationSurface);
 
         // Calculate slope statistics
         const slopeStats = this.calculateSlopeStatistics(elevationSurface);
@@ -644,12 +650,12 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
- * Get neighboring cells for a given cell index
- * @param {number} cellIndex - Index of the current cell
- * @param {number} rows - Number of rows in the grid
- * @param {number[]} cells - Array of cell elevation values
- * @returns {Array<{index: number, elevation: number}>} Array of neighbor objects
- */
+     * Get neighboring cells for a given cell index
+     * @param {number} cellIndex - Index of the current cell
+     * @param {number} rows - Number of rows in the grid
+     * @param {number[]} cells - Array of cell elevation values
+     * @returns {Array<{index: number, elevation: number}>} Array of neighbor objects
+     */
     static getNeighbors(cellIndex, rows, cells) {
         const row = Math.floor(cellIndex / rows);
         const col = cellIndex % rows;
@@ -853,7 +859,7 @@ class AgriculturalLandAnalyzer {
         // Cache results
         this.#slopeDistributionCache.set(cacheKey, Object.freeze(distribution));
 
-        logger.info('Slope distribution calculated', { distribution });
+        logger.info('Slope distribution calculated...');
 
         return distribution;
     }
