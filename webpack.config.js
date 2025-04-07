@@ -4,10 +4,13 @@ const nodeExternals = require('webpack-node-externals');
 module.exports = {
   target: 'node',
   mode: process.env.NODE_ENV || 'development',
-  entry: './app.js',
+  entry: {
+    app: './app.js',
+    worker: './workers/analysisWorker.js'
+  },
   output: {
     path: path.resolve(__dirname, 'dist'),
-    filename: 'app.js'
+    filename: '[name].js'
   },
   module: {
     rules: [
@@ -20,7 +23,7 @@ module.exports = {
       }
     ]
   },
-  externals: [nodeExternals()], // excludes node_modules from the bundle
+  externals: [nodeExternals()],
   node: {
     __dirname: false,
     __filename: false

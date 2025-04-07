@@ -22,6 +22,7 @@ const config = {
         methods: ['GET', 'POST']
     },
     gmrtApiUrl: process.env.GMRT_API_URL || 'https://www.gmrt.org:443/services/PointServer',
+    meteoApiUrl: process.env.METEO_API_URL || 'https://api.open-meteo.com/v1/elevation',
 };
 
 module.exports = config;
