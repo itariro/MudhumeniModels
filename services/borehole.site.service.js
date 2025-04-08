@@ -924,9 +924,9 @@ class BoreholeSiteService {
         const avg = this.average(monthlyRainfall);
         const stdDev = Math.sqrt(monthlyRainfall.reduce((sum, val) => sum + Math.pow(val - avg, 2), 0) / monthlyRainfall.length);
 
-        // Use a more reasonable threshold with a minimum value
-        const calculatedThreshold = avg + (stdDev * 0.5);
-        return Math.min(calculatedThreshold, 30); // Cap at 50mm to avoid unrealistic thresholds
+        // Use a more reasonable threshold with a lower minimum value
+        const calculatedThreshold = avg + (stdDev * 0.3); // Reduced from 0.5
+        return Math.min(calculatedThreshold, 20); // Lowered from 30 to 20mm
     }
 
     /**
@@ -975,7 +975,7 @@ class BoreholeSiteService {
             // More lenient comparison - use either percentage of max rainfall or absolute threshold
             return record.rain > Math.min(
                 rechargeThreshold * soilFactor * slopeFactor,
-                maxRainfall * 0.6 // Consider top 40% of rainfall events as recharge events
+                maxRainfall * 0.7 // Consider top 30% of rainfall events as recharge events (changed from 0.6)
             );
         }).map(record => ({
             date: new Date(record.dt),
@@ -1014,6 +1014,13 @@ class BoreholeSiteService {
      * calculateRechargeEfficiency([{dt: 123, rain: 15}], {'0': 10}, 12)
      */
     static calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold) {
+        console.log('Recharge efficiency calculation:', {
+            precipDataLength: precipData.length,
+            rechargeThreshold: rechargeThreshold,
+            hasRainfall: precipData.some(record => record.rain > 0),
+            maxRainfall: Math.max(...precipData.map(record => record.rain || 0))
+        });
+
         // Check if there's any rainfall
         const hasRainfall = precipData.some(record => record.rain > 0);
         if (!hasRainfall) {
@@ -1023,15 +1030,49 @@ class BoreholeSiteService {
 
         let totalRecharge = 0;
         let totalRainfall = 0;
+        let monthlyEfficiencies = [];
 
         precipData.forEach(record => {
+            const date = new Date(record.dt);
+            const month = date.getMonth();
+            const monthlyAverage = monthlyAverages[month] || 0;
+
+            // Calculate a dynamic threshold based on monthly average
+            const adjustedThreshold = monthlyAverage > 0
+                ? (rechargeThreshold * 0.7) + (rechargeThreshold * 0.3 * (record.rain / monthlyAverage))
+                : rechargeThreshold;
+
             totalRainfall += record.rain;
-            if (record.rain > rechargeThreshold) {
-                totalRecharge += record.rain;
+
+            // Consider both absolute threshold and relative to monthly average
+            if (record.rain > adjustedThreshold && record.rain > monthlyAverage * 0.5) {
+                // Weight the recharge based on how much it exceeds both thresholds
+                const rechargeWeight = Math.min(
+                    (record.rain / adjustedThreshold),
+                    (record.rain / (monthlyAverage * 0.5))
+                );
+                totalRecharge += record.rain * rechargeWeight;
+
+                // Track monthly efficiency
+                monthlyEfficiencies[month] = monthlyEfficiencies[month] || { total: 0, count: 0 };
+                monthlyEfficiencies[month].total += rechargeWeight;
+                monthlyEfficiencies[month].count++;
             }
         });
 
-        return totalRainfall === 0 ? 0.01 : totalRecharge / totalRainfall;
+        // Calculate average monthly efficiency
+        const monthlyEfficiencyAvg = monthlyEfficiencies
+            .filter(Boolean)
+            .reduce((avg, month) => avg + (month.total / month.count), 0) /
+            monthlyEfficiencies.filter(Boolean).length || 0;
+
+        // Combine both overall and monthly efficiency
+        const overallEfficiency = totalRainfall === 0 ? 0.01 : totalRecharge / totalRainfall;
+        const finalEfficiency = monthlyEfficiencyAvg > 0
+            ? (overallEfficiency * 0.7) + (monthlyEfficiencyAvg * 0.3)
+            : overallEfficiency;
+
+        return Math.min(Math.max(finalEfficiency, 0.01), 1);
     }
 
     static calculateReliabilityScores(metrics) {

@@ -1,11 +1,10 @@
 const axios = require('axios');
 const turf = require('@turf/turf');
-const booleanValid = require('@turf/boolean-valid');
 const winston = require('winston');
 const { valid } = require('geojson-validation');
+const { default: PQueue } = require('p-queue');
 const config = require('../config/config');
 
-// Configure logger
 // Configure Winston logger
 const logger = winston.createLogger({
     level: 'info',
@@ -75,11 +74,11 @@ class StatisticsUtils {
     }
 
     /**
- * Calculate confidence interval for an array of values
- * @param {number[]} values - Array of numbers
- * @param {number} confidence - Confidence level (default 0.95)
- * @returns {Object} - Object containing lower and upper bounds
- */
+     * Calculate confidence interval for an array of values
+     * @param {number[]} values - Array of numbers
+     * @param {number} confidence - Confidence level (default 0.95)
+     * @returns {Object} - Object containing lower and upper bounds
+     */
     static confidenceInterval(values, confidence = 0.95) {
         console.log('Calculating confidence interval...', values);
         if (values.length < 2) {
@@ -119,6 +118,7 @@ class StatisticsUtils {
 class AgriculturalLandAnalyzer {
     // Configuration constants
     static GMRT_API_URL = config.gmrtApiUrl || 'https://www.gmrt.org:443/services/PointServer';
+    static METEO_API_URL = config.meteoApiUrl || 'https://api.open-meteo.com/v1/elevation';
     static EARTH_RADIUS = 6371000; // meters
     static MAX_BATCH_SIZE = 20; // Maximum points per API batch
     static REQUEST_DELAY_MS = 500; // Delay between API batches
@@ -175,13 +175,17 @@ class AgriculturalLandAnalyzer {
             // Generate sampling points within the polygon
             const samplingPoints = this.generateSamplingPoints(geoJson);
 
-            // Fetch elevation data for all points
+            console.log('Fetching elevation data...');
             const elevationData = await this.fetchElevationData(samplingPoints);
-            if (elevationData.length < 2) {
-                logger.warn(`Insufficient elevation data: ${elevationData.length} valid points`);
-            }
 
-            const elevations = this.extractElevations(elevationData);
+            const transformedElevationData = this.transformElevationData(elevationData);
+            console.log('Transformed elevation data...');
+
+            const elevations = elevationData
+                .filter(item => item.status === "fulfilled")
+                .flatMap(item => item.value.elevation);
+            console.log('Elevations:', elevations);
+
             const { mean, median, min, max } = StatisticsUtils;
 
             this.FIELD_ELEVATION = {
@@ -190,10 +194,10 @@ class AgriculturalLandAnalyzer {
                 MIN: parseFloat(min(elevations)),
                 MAX: parseFloat(max(elevations))
             };
-            console.log('Elevation data:', elevationData);
+            console.log('Elevation data:', this.FIELD_ELEVATION);
 
             // Perform comprehensive analysis
-            const analysis = await this.performAnalysis(geoJson, elevationData);
+            const analysis = await this.performAnalysis(geoJson, transformedElevationData);
             console.log('Analysis:', analysis);
 
             logger.info('Analysis completed successfully');
@@ -205,12 +209,27 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
-     * Extract the elevation values from the provided data.
-     * @param {Object[]} data - An array of data objects, each containing an 'elevation' property.
-     * @returns {number[]} - An array of elevation values extracted from the input data.
+     * Transforms raw elevation data into a structured array of elevation points
+     * @param {Array} data - Raw elevation data from API response
+     * @returns {Array} An array of objects with elevation and coordinate information
      */
-    static extractElevations(data) {
-        return data.map(item => item.elevation);
+    static transformElevationData(data) {
+        if (data[0].status === "fulfilled") {
+            const { elevation, coordinates } = data[0].value;
+
+            // Split the single string in lon and lat into actual arrays
+            const lonArray = coordinates.lon[0].split(',').map(parseFloat);
+            const latArray = coordinates.lat[0].split(',').map(parseFloat);
+
+            return elevation.map((ele, index) => ({
+                elevation: ele,
+                coordinates: {
+                    lon: lonArray[index],
+                    lat: latArray[index]
+                }
+            }));
+        }
+        return [];
     }
 
     /**
@@ -314,71 +333,24 @@ class AgriculturalLandAnalyzer {
      * @returns {Promise<Object[]>} - Array of elevation data objects
      */
     static async fetchElevationData(points) {
-        // Input validation
-        if (!points?.features?.length) {
-            throw new Error('Invalid points input: Empty or missing features array');
-        }
+        const queue = new PQueue({
+            concurrency: 8,
+            interval: 1000,
+            intervalCap: 50
+        });
 
-        const coordinates = points.features.map(f => f.geometry.coordinates);
-        const results = [];
-        const total = coordinates.length;
+        const coordinates_list_lat = [];
+        const coordinates_list_lon = [];
+        points.features.forEach(f => {
+            coordinates_list_lon.push(f.geometry.coordinates[0]);
+            coordinates_list_lat.push(f.geometry.coordinates[1]);
+        });
 
-        // Dynamic batch size calculation
-        const batchSize = this.getBatchSize(total);
-
-        // Exponential backoff configuration
-        const maxRetries = 3;
-        const backoff = (attempt) => this.REQUEST_DELAY_MS * Math.pow(2, attempt);
-
-        logger.info(`Starting elevation data fetch for ${total} points`);
-
-        for (let i = 0; i < coordinates.length; i += batchSize) {
-            const batch = coordinates.slice(i, i + batchSize);
-
-            // Progress tracking
-            const progress = Math.round((i / total) * 100);
-            logger.info(`Elevation data fetch progress: ${progress}%`);
-
-            // Implement retry with backoff
-            let attempt = 0;
-            let batchResults;
-
-            while (attempt < maxRetries) {
-                try {
-                    await new Promise(resolve => setTimeout(resolve, backoff(attempt)));
-                    const batchPromises = batch.map(coord =>
-                        this.fetchSinglePointElevation(coord[1], coord[0])
-                    );
-                    batchResults = await Promise.allSettled(batchPromises);
-                    break;
-                } catch (error) {
-                    attempt++;
-                    logger.warn(`Batch retry ${attempt}/${maxRetries} due to: ${error.message}`);
-                    if (attempt === maxRetries) {
-                        logger.error(`Failed to fetch batch after ${maxRetries} attempts`);
-                        throw error;
-                    }
-                }
-            }
-            results.push(...batchResults.map(r => r.status === 'fulfilled' ? r.value : null));
-        }
-
-        // Calculate and log success statistics
-        const validResults = results.filter(r => r !== null);
-        const successRate = (validResults.length / results.length) * 100;
-
-        logger.info(`Elevation fetch complete: ${successRate.toFixed(2)}% success rate`);
-        logger.info(`Retrieved ${validResults.length} valid elevation points out of ${results.length} total`);
-
-        return validResults;
-    }
-
-    // Helper method for dynamic batch size calculation
-    static getBatchSize(total) {
-        const OPTIMAL_BATCHES = 10;
-        return Math.min(
-            this.MAX_BATCH_SIZE,
-            Math.ceil(total / OPTIMAL_BATCHES)
+        const coordinates_list_ = [{ lat: JSON.stringify(coordinates_list_lat).slice(1, -1), long: JSON.stringify(coordinates_list_lon).slice(1, -1) }];
+        return Promise.allSettled(
+            coordinates_list_.map(f => queue.add(() =>
+                this.fetchSinglePointElevation(f.long, f.lat)
+            ))
         );
     }
 
@@ -388,38 +360,52 @@ class AgriculturalLandAnalyzer {
      * @param {number} lon - Longitude
      * @returns {Promise<Object>} - Elevation data object
      */
-    static async fetchSinglePointElevation(lat, lon) {
-        // Add input validation
-        if (!this.isValidCoordinate(lat, lon)) {
-            throw new Error('Invalid coordinates');
-        }
-
-        // Add retry mechanism
-        let retries = 3;
-        while (retries > 0) {
+    static async fetchSinglePointElevation(lon, lat) {
+        let lastError = null;
+        for (let attempt = 1; attempt <= 5; attempt++) {
             try {
-                const response = await axios.get(`${this.GMRT_API_URL}?longitude=${lon}&latitude=${lat}&format=json`, { timeout: 5000 });
+                const response = await axios.get(`${this.METEO_API_URL}?longitude=${lon}&latitude=${lat}&format=json`, {
+                    timeout: 3000,
+                    headers: { 'Retry-After': attempt * 1000 }
+                });
+
                 if (!response.data?.elevation) {
                     throw new Error('Invalid elevation data');
                 }
+
                 return {
-                    coordinates: [lon, lat],
-                    elevation: parseFloat(response.data.elevation)
+                    coordinates: { lon: [lon], lat: [lat] },
+                    elevation: response.data.elevation
                 };
             } catch (error) {
-                retries--;
-                if (retries === 0) throw error;
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                lastError = error;
+                if (error.response?.status === 429) {
+                    await this.circuitBreaker();
+                }
+                // Continue to next retry attempt
+                continue;
             }
         }
+        // If all retries failed, throw the last error
+        throw new Error(`Failed to fetch elevation data after 5 attempts: ${lastError?.message || 'Unknown error'}`);
+    }
+
+    static validateElevation(data, lon, lat) {
+        if (!data?.elevation || data.elevation < -11000 || data.elevation > 9000) {
+            throw new Error(`Invalid elevation: ${data.elevation}`);
+        }
+        return {
+            coordinates: [lon, lat],
+            elevation: parseFloat(data.elevation)
+        };
     }
 
     /**
- * Validates geographic coordinates
- * @param {number} lat - Latitude value
- * @param {number} lon - Longitude value
- * @returns {boolean} - True if coordinates are valid
- */
+     * Validates geographic coordinates
+     * @param {number} lat - Latitude value
+     * @param {number} lon - Longitude value
+     * @returns {boolean} - True if coordinates are valid
+     */
     static isValidCoordinate(lat, lon) {
         // Check if inputs are numbers and not NaN
         if (typeof lat !== 'number' || typeof lon !== 'number' ||
@@ -458,24 +444,24 @@ class AgriculturalLandAnalyzer {
     static async performAnalysis(geoJson, elevationData) {
         const area = turf.area(geoJson);
         this.POLYGON_AREA = area;
+        
+        // 1. Prepare elevation data points
         const points = elevationData.map(d => ({
             type: 'Feature',
             geometry: {
                 type: 'Point',
-                coordinates: d.coordinates
+                coordinates: [d.coordinates.lon, d.coordinates.lat]
             },
             properties: {
                 elevation: d.elevation
             }
         }));
 
-        // Create elevation surface for analysis
+        // 2. Create elevation surface (lightweight operation in main thread)
         const elevationSurface = turf.tin(turf.featureCollection(points), 'elevation');
-        console.log('Elevation surface:', elevationSurface);
 
         // Calculate slope statistics
         const slopeStats = this.calculateSlopeStatistics(elevationSurface);
-        console.log('Slope stats:', slopeStats);
         // Analyze terrain characteristics
         const terrainAnalysis = this.analyzeTerrainCharacteristics(elevationSurface, slopeStats);
         console.log('Terrain analysis:', terrainAnalysis);

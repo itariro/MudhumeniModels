@@ -1,6 +1,5 @@
 const axios = require('axios');
 const turf = require('@turf/turf');
-const booleanValid = require('@turf/boolean-valid');
 const winston = require('winston');
 const { valid } = require('geojson-validation');
 const config = require('../config/config');
