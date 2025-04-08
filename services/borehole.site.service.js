@@ -297,7 +297,7 @@ class BoreholeSiteService {
      */
     static async analyzePrecipitation(lat, lon) {
         // Constants for configuration
-        const HISTORICAL_YEARS = 5;
+        const HISTORICAL_YEARS = 10;
         const DEFAULT_SOIL_MOISTURE = 0.4;
         const API_TIMEOUT = 20000; // Increased to 20 seconds
         const MAX_RETRIES = 3;
