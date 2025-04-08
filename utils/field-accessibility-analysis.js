@@ -758,84 +758,215 @@ class FarmRouteAnalyzer {
     }
 
     /**
-     * Calculates road hazards for different road types based on field coordinates and road metrics.
+     * Calculates hazards along routes from a field to various road types
      * 
-     * @param {Object} coordinates - The geographic coordinates of the field
-     * @param {Object} metrics - Road distance metrics for different road types
-     * @returns {Promise<Object>} A comprehensive hazard analysis for primary, secondary, tertiary roads, and city/town segments
-     * @throws {Error} If hazard calculation encounters any issues during processing
+     * @param {Object} coordinates - The coordinates of the field (lat/lon)
+     * @param {Object} metrics - Distance metrics to different road types
+     * @returns {Object} Hazard information for different road segments
      */
     async calculateHazardsForRoads(coordinates, metrics) {
-        const hazards = {};
+        // Initialize hazards object with default structure
+        const hazards = {
+            critical_segment: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
+            secondary: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
+            tertiary: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
+            city: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
+            town: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 }
+        };
+
+        // Configuration constants
+        const TIMEOUT = 15000; // 15 second timeout for external API calls
+        const MAX_RETRIES = 2;  // Maximum number of retries for failed operations
+
+        // Create a timeout promise
+        const createTimeout = (ms) => {
+            return new Promise((_, reject) => {
+                setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms);
+            });
+        };
+
+        // Execute promise with timeout and retry logic
+        const withTimeoutAndRetry = async (promiseFn, ms, retries = 0) => {
+            try {
+                return await Promise.race([promiseFn(), createTimeout(ms)]);
+            } catch (error) {
+                if (retries < MAX_RETRIES) {
+                    console.warn(`Retrying operation (${retries + 1}/${MAX_RETRIES})...`);
+                    return withTimeoutAndRetry(promiseFn, ms, retries + 1);
+                }
+                throw error;
+            }
+        };
 
         try {
-            // Find nearest primary road point
-            const primaryRoadInfo = await this.findNearestPrimaryRoadPoint(coordinates);
+            // Validate input parameters
+            if (!coordinates || !coordinates.lat || !coordinates.lon) {
+                throw new Error("Invalid coordinates provided");
+            }
 
-            if (primaryRoadInfo.point) {
-                // Get actual route from field to primary road
-                const routeToMainRoad = await this.calculateRealRouteWithCache(
-                    coordinates,
-                    primaryRoadInfo.point
-                );
+            if (!metrics || typeof metrics !== 'object') {
+                throw new Error("Invalid metrics object provided");
+            }
 
-                // Extract route geometry as GeoJSON
-                const routeGeometry = routeToMainRoad.features[0].geometry;
+            // Find nearest primary road point with timeout and retry
+            const primaryRoadInfo = await withTimeoutAndRetry(
+                () => this.findNearestPrimaryRoadPoint(coordinates),
+                TIMEOUT
+            );
 
-                // Analyze hazards along this critical segment
-                const hazardAnalysis = await this.queryHazards(routeGeometry);
+            if (!primaryRoadInfo || !primaryRoadInfo.point) {
+                throw new Error("No primary road found within search radius");
+            }
 
-                // Store hazard information for the critical segment
-                hazards.critical_segment = {
-                    distance: primaryRoadInfo.distance,
-                    bridges: hazardAnalysis.bridges.length,
-                    water_crossings: hazardAnalysis.water.length,
-                    landslides: hazardAnalysis.landslides.length,
-                    risk_score: this.calculateCompositeRisk(hazardAnalysis)
-                };
+            // Get actual route from field to primary road
+            const primaryRoutePromise = withTimeoutAndRetry(
+                () => this.calculateRealRouteWithCache(coordinates, primaryRoadInfo.point),
+                TIMEOUT
+            );
 
-                // For other road types, we'll maintain simplified analysis
-                for (const roadType of ['secondary', 'tertiary']) {
-                    if (metrics[`distance_to_${roadType}`] > 0) {
-                        // Only analyze if this road type is closer than primary
-                        if (metrics[`distance_to_${roadType}`] < primaryRoadInfo.distance) {
-                            const nearestPoint = await this.findNearestRoadPoint(coordinates, roadType);
-                            if (nearestPoint) {
-                                const routeToRoad = await this.calculateRealRouteWithCache(
-                                    coordinates,
-                                    nearestPoint
-                                );
-                                const routeGeom = routeToRoad.features[0].geometry;
-                                const roadHazards = await this.queryHazards(routeGeom);
+            // Prepare promises for secondary and tertiary roads in parallel
+            const roadPromises = [];
+            const roadTypes = ['secondary', 'tertiary'];
 
-                                hazards[roadType] = {
-                                    bridges: roadHazards.bridges.length,
-                                    water_crossings: roadHazards.water.length,
-                                    landslides: roadHazards.landslides.length,
-                                    risk_score: this.calculateCompositeRisk(roadHazards)
+            for (const roadType of roadTypes) {
+                // Only analyze if this road type exists and is closer than primary
+                if (metrics[`distance_to_${roadType}`] > 0 &&
+                    metrics[`distance_to_${roadType}`] < primaryRoadInfo.distance) {
+
+                    roadPromises.push(
+                        withTimeoutAndRetry(() => this.findNearestRoadPoint(coordinates, roadType), TIMEOUT)
+                            .then(nearestPoint => {
+                                if (!nearestPoint) return null;
+                                return {
+                                    type: roadType,
+                                    point: nearestPoint,
+                                    routePromise: withTimeoutAndRetry(
+                                        () => this.calculateRealRouteWithCache(coordinates, nearestPoint),
+                                        TIMEOUT
+                                    )
                                 };
-                            }
-                        }
-                    }
+                            })
+                            .catch(err => {
+                                console.warn(`Error finding ${roadType} road:`, err);
+                                return null;
+                            })
+                    );
+                } else {
+                    roadPromises.push(Promise.resolve(null));
                 }
             }
 
-            // For cities and towns, we'll just use the critical segment hazards
-            // since we're focusing on the field-to-main-road segment
+            // Wait for all road points to be found
+            const [primaryRoute, ...otherRoads] = await Promise.all([
+                primaryRoutePromise,
+                ...roadPromises
+            ]);
+
+            // Validate primary route data
+            if (!primaryRoute || !primaryRoute.features || !primaryRoute.features[0] ||
+                !primaryRoute.features[0].geometry) {
+                throw new Error("Invalid primary route data returned from routing service");
+            }
+
+            // Extract route geometry and analyze primary road hazards
+            const primaryRouteGeometry = primaryRoute.features[0].geometry;
+            const primaryHazardAnalysis = await withTimeoutAndRetry(
+                () => this.queryHazards(primaryRouteGeometry),
+                TIMEOUT
+            );
+
+            // Validate hazard analysis data
+            if (!primaryHazardAnalysis ||
+                !Array.isArray(primaryHazardAnalysis.bridges) ||
+                !Array.isArray(primaryHazardAnalysis.water) ||
+                !Array.isArray(primaryHazardAnalysis.landslides)) {
+                throw new Error("Invalid hazard analysis data for primary route");
+            }
+
+            // Store hazard information for the critical segment
+            hazards.critical_segment = {
+                distance: primaryRoadInfo.distance,
+                bridges: primaryHazardAnalysis.bridges.length,
+                water_crossings: primaryHazardAnalysis.water.length,
+                landslides: primaryHazardAnalysis.landslides.length,
+                risk_score: this.calculateCompositeRisk(primaryHazardAnalysis)
+            };
+
+            // Process other road types in parallel with error handling for each
+            const hazardPromises = otherRoads
+                .filter(road => road !== null)
+                .map(async (road) => {
+                    try {
+                        const route = await road.routePromise;
+
+                        // Validate route data
+                        if (!route || !route.features || !route.features[0] || !route.features[0].geometry) {
+                            throw new Error(`Invalid route data for ${road.type} road`);
+                        }
+
+                        const routeGeom = route.features[0].geometry;
+                        const roadHazards = await withTimeoutAndRetry(
+                            () => this.queryHazards(routeGeom),
+                            TIMEOUT
+                        );
+
+                        // Validate hazard data
+                        if (!roadHazards ||
+                            !Array.isArray(roadHazards.bridges) ||
+                            !Array.isArray(roadHazards.water) ||
+                            !Array.isArray(roadHazards.landslides)) {
+                            throw new Error(`Invalid hazard data for ${road.type} road`);
+                        }
+
+                        return {
+                            type: road.type,
+                            hazardData: {
+                                bridges: roadHazards.bridges.length,
+                                water_crossings: roadHazards.water.length,
+                                landslides: roadHazards.landslides.length,
+                                risk_score: this.calculateCompositeRisk(roadHazards)
+                            }
+                        };
+                    } catch (err) {
+                        console.warn(`Error processing ${road.type} road:`, err);
+                        return {
+                            type: road.type,
+                            hazardData: {
+                                bridges: 0,
+                                water_crossings: 0,
+                                landslides: 0,
+                                risk_score: 0,
+                                error: err.message
+                            }
+                        };
+                    }
+                });
+
+            // Wait for all hazard analyses to complete
+            const hazardResults = await Promise.allSettled(hazardPromises);
+
+            // Assign results to appropriate road types
+            hazardResults.forEach(result => {
+                if (result.status === 'fulfilled' && result.value) {
+                    hazards[result.value.type] = result.value.hazardData;
+                }
+            });
+
+            // For cities and towns, use the critical segment hazards
+            // This is intentional as we're focusing on the field-to-main-road segment
             hazards.city = hazards.critical_segment;
             hazards.town = hazards.critical_segment;
 
             return hazards;
         } catch (error) {
             console.error("Error calculating hazards:", error);
-            // Return empty hazard data as fallback
-            return {
-                critical_segment: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
-                secondary: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
-                tertiary: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
-                city: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
-                town: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 }
-            };
+
+            // Add error information to critical segment
+            hazards.critical_segment.error = error.message;
+            hazards.critical_segment.error_type = error.name;
+            hazards.critical_segment.error_stack = process.env.NODE_ENV === 'development' ? error.stack : undefined;
+
+            return hazards;
         }
     }
 
