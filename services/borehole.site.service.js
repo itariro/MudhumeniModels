@@ -66,37 +66,51 @@ class BoreholeSiteService {
             const center = area.centroid().coordinates().getInfo();
             const [lon, lat] = center;
 
-            const hydroGeologicalFeatures = this.findFeaturesAtPoint(
-                lat,  // Latitude
-                lon,   // Longitude
-                hydroGeologicalMapZimbabwe
-            );
+            // Step 1: Execute completely independent operations in parallel
+            const [
+                hydroGeologicalFeatures,
+                fieldPotentialAnalysis,
+                accessibilityPromise,
+                groundwaterResults
+            ] = await Promise.all([
+                // Find hydro-geological features
+                this.findFeaturesAtPoint(lat, lon, hydroGeologicalMapZimbabwe),
 
-            // Perform field potential analysis
-            const fieldPotentialAnalysis = await AgriculturalLandAnalyzer.analyzeArea(polygon.geometry);
+                // Analyze agricultural land potential
+                AgriculturalLandAnalyzer.analyzeArea(polygon.geometry),
 
-            let AccessibilityAnalysis = [];
-            try {
-                const analyzer = new FarmRouteAnalyzer();
-                AccessibilityAnalysis = await analyzer.analyzeFieldAccessibility({ lat, lon });
-            } catch (error) {
-                logger.error('Accessibility analysis failed:', error);
-                throw new Error(`Failed to analyze route accessibility: ${error.message}`);
-            }
-            // Perform groundwater potential analysis
-            const { potentialMap, precipitationAnalysis, waterAvailability } = await this.calculateGroundwaterPotential(area);
+                // Analyze field accessibility (wrapped in a promise to handle potential errors)
+                (async () => {
+                    try {
+                        const analyzer = new FarmRouteAnalyzer();
+                        return await analyzer.analyzeFieldAccessibility({ lat, lon });
+                    } catch (error) {
+                        logger.error('Accessibility analysis failed:', error);
+                        throw new Error(`Failed to analyze route accessibility: ${error.message}`);
+                    }
+                })(),
 
-            // Estimate borehole depth
-            const boreholeDepthAnalysis = await this.estimateBoreholeDepth(area, precipitationAnalysis);
+                // Calculate groundwater potential
+                this.calculateGroundwaterPotential(area)
+            ]);
 
-            // Calculate success probability
-            logger.info('Calculating success probability...');
-            let boreholeSucessAnalysis = {};
-            await this.calculateSuccessProbability(
-                { area }, [], precipitationAnalysis
-            ).then(result => {
-                boreholeSucessAnalysis = result;
-            });
+            // Extract results from groundwater analysis
+            const { potentialMap, precipitationAnalysis, waterAvailability } = groundwaterResults;
+
+            // Step 2: Execute operations that depend on precipitationAnalysis in parallel
+            const [boreholeDepthAnalysis, boreholeSucessAnalysis] = await Promise.all([
+                // Estimate borehole depth
+                this.estimateBoreholeDepth(area, precipitationAnalysis),
+
+                // Calculate success probability
+                (async () => {
+                    logger.info('Calculating success probability...');
+                    return this.calculateSuccessProbability({ area }, [], precipitationAnalysis);
+                })()
+            ]);
+
+            // Resolve the accessibility analysis promise
+            const accessibilityAnalysis = await accessibilityPromise;
 
             // Return final response
             return {
@@ -111,7 +125,7 @@ class BoreholeSiteService {
                     hydroGeologicalFeatures,
                     potentialMap,
                 },
-                accessibility: { AccessibilityAnalysis },
+                accessibility: { accessibilityAnalysis },
             };
         } catch (error) {
             logger.error('Error in identifyLocations:', error);
@@ -555,18 +569,18 @@ class BoreholeSiteService {
             metrics.seasonalPatterns = seasonalResults.seasonalPatterns;
             metrics.trends = trends;
 
-            // Execute dependent calculations sequentially
-            metrics.extremeEvents = await Promise.resolve(
-                this.identifyExtremeEvents(precipData, metrics.monthlyAverages)
-            );
-
-            metrics.rechargePatterns = await Promise.resolve(
+            // Execute independent calculations in parallel
+            const [extremeEvents, rechargePatterns] = await Promise.all([
+                this.identifyExtremeEvents(precipData, metrics.monthlyAverages),
                 this.analyzeRechargePatterns(precipData, metrics.monthlyAverages)
-            );
+            ]);
 
-            metrics.reliabilityScores = await Promise.resolve(
-                this.calculateReliabilityScores(metrics)
-            );
+            // Assign results to metrics object
+            metrics.extremeEvents = extremeEvents;
+            metrics.rechargePatterns = rechargePatterns;
+
+            // Calculate reliability scores (depends on updated metrics)
+            metrics.reliabilityScores = await this.calculateReliabilityScores(metrics);
 
             return metrics;
         } catch (error) {
@@ -1075,7 +1089,7 @@ class BoreholeSiteService {
         return Math.min(Math.max(finalEfficiency, 0.01), 1);
     }
 
-    static calculateReliabilityScores(metrics) {
+    static async calculateReliabilityScores(metrics) {
         return {
             overall: this.calculateOverallReliability(metrics),
             seasonal: this.calculateSeasonalReliability(metrics.seasonalPatterns),
