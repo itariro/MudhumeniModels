@@ -1,9 +1,18 @@
 const { parentPort, workerData } = require('worker_threads');
 const turf = require('@turf/turf');
+const { TDigest } = require('tdigest');
 const AgriculturalLandAnalyzer = require('../utils/elevation-analysis');
 
 // Configure performance monitoring
 const { performance } = require('perf_hooks');
+
+// Helper function to ensure arrays are properly handled
+function ensureRegularArray(possibleArray) {
+  if (!possibleArray) return null;
+  if (Array.isArray(possibleArray)) return possibleArray;
+  if (ArrayBuffer.isView(possibleArray)) return Array.from(possibleArray);
+  return null;
+}
 
 // Helper function to reconstruct proper GeoJSON structure with validation
 function reconstructElevationSurface(serialized) {
@@ -17,7 +26,6 @@ function reconstructElevationSurface(serialized) {
       if (!f?.geometry?.coordinates) {
         throw new Error('Invalid feature structure');
       }
-
       return {
         type: 'Feature',
         properties: { ...f.properties },
@@ -31,8 +39,15 @@ function reconstructElevationSurface(serialized) {
 }
 
 // Process chunks of data
+// In your processDataChunk function
 async function processDataChunk(chunk, config) {
   const startTime = performance.now();
+
+  // Ensure AgriculturalLandAnalyzer is properly configured
+  if (typeof AgriculturalLandAnalyzer.POLYGON_AREA === 'undefined' &&
+    data.POLYGON_AREA !== undefined) {
+    AgriculturalLandAnalyzer.POLYGON_AREA = data.POLYGON_AREA;
+  }
 
   const elevationSurface = reconstructElevationSurface(chunk);
   const slopeStats = AgriculturalLandAnalyzer.calculateSlopeStatistics(elevationSurface);
@@ -56,25 +71,24 @@ parentPort.on('message', async (data) => {
     const startTime = performance.now();
     const memoryBefore = process.memoryUsage();
 
-    // Process data in chunks
-    // const CHUNK_SIZE = 1000;
-    // const chunks = [];
-    // for (let i = 0; i < data.elevationSurface.features.length; i += CHUNK_SIZE) {
-    //   chunks.push({
-    //     ...data.elevationSurface,
-    //     features: data.elevationSurface.features.slice(i, i + CHUNK_SIZE)
-    //   });
-    // }
+    // Process chunks in parallel
+    const chunkPromises = data.chunks.map(chunk =>
+      processDataChunk(chunk, data.config)
+    );
 
-    // Process all chunks
-    const chunkResults = [
-      await processDataChunk(data.elevationSurface, data.config)
-    ];
+    // Add timeout protection
+    const chunkResults = await Promise.all(chunkPromises.map(p =>
+      Promise.race([
+        p,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Chunk processing timeout')), data.config?.timeout || 30000)
+        )
+      ])
+    ));
 
     // Merge results
     const mergedResults = chunkResults.reduce((acc, result, idx) => {
       if (idx === 0) return result;
-
       return {
         slopeStats: combineStats(acc.slopeStats, result.slopeStats),
         terrainAnalysis: combineTerrainAnalysis(acc.terrainAnalysis, result.terrainAnalysis),
@@ -113,16 +127,70 @@ parentPort.on('message', async (data) => {
   }
 });
 
-// Helper functions for combining results
-function combineStats(stats1, stats2) {
-  if (!stats1) return stats2;
-  if (!stats2) return stats1;
+// Rest of your helper functions remain unchanged
+// function combineStats(stats1, stats2) {
+//   if (!stats1) return stats2;
+//   if (!stats2) return stats1;
 
-  const combinedSlopes = [...stats1.slopes, ...stats2.slopes];
+//   // Ensure slopes are regular arrays
+//   const slopes1 = ensureRegularArray(stats1.slopes || []);
+//   const slopes2 = ensureRegularArray(stats2.slopes || []);
+//   const combinedSlopes = [...slopes1, ...slopes2];
+
+//   return {
+//     mean: (stats1.mean + stats2.mean) / 2,
+//     median: calculateMedian(combinedSlopes),
+//     stdDev: calculateStdDev(combinedSlopes),
+//     confidence: combineConfidenceIntervals(stats1.confidence, stats2.confidence),
+//     distribution: combineDistributions(stats1.distribution, stats2.distribution),
+//     aspectAnalysis: combineAspects(stats1.aspectAnalysis, stats2.aspectAnalysis)
+//   };
+// }
+
+
+class StreamingStats {
+  constructor() {
+    this.tdigest = new TDigest();
+    this.sum = 0;
+    this.count = 0;
+    this.squareSum = 0;
+  }
+
+  update(value) {
+    this.tdigest.push(value);
+    this.sum += value;
+    this.count++;
+    this.squareSum += value * value;
+  }
+
+  get median() {
+    return this.tdigest.percentile(50);
+  }
+
+  get mean() {
+    return this.sum / this.count;
+  }
+
+  get stdDev() {
+    return Math.sqrt((this.squareSum / this.count) - Math.pow(this.mean, 2));
+  }
+}
+
+// Modified combineStats
+function combineStats(stats1, stats2) {
+  const combined = new StreamingStats();
+  [stats1, stats2].forEach(s => {
+    if (s?.tdigest) {
+      combined.tdigest.push(s.tdigest);
+      combined.sum += s.sum;
+      combined.count += s.count;
+      combined.squareSum += s.squareSum;
+    }
+  });
   return {
-    mean: (stats1.mean + stats2.mean) / 2,
-    median: calculateMedian(combinedSlopes),
-    stdDev: calculateStdDev(combinedSlopes),
+    mean: combined.mean,
+    median: combined.median,
+    stdDev: combined.stdDev,
     confidence: combineConfidenceIntervals(stats1.confidence, stats2.confidence),
     distribution: combineDistributions(stats1.distribution, stats2.distribution),
     aspectAnalysis: combineAspects(stats1.aspectAnalysis, stats2.aspectAnalysis)
@@ -330,6 +398,33 @@ function safeCombine(fn, a, b) {
     return a || b || null;
   }
 }
+
+// In analysisWorker.js
+const memoryMonitor = {
+  threshold: 0.8 * 1024 * 1024 * 1024, // 80% of 1GB
+  check() {
+    const used = process.memoryUsage().heapUsed;
+    if (used > this.threshold) {
+      if (global.gc) {
+        global.gc();
+        logger.info('Forced garbage collection');
+      }
+      return true;
+    }
+    return false;
+  }
+};
+
+// Add to main processing loop
+setInterval(() => {
+  if (memoryMonitor.check()) {
+    parentPort.postMessage({
+      type: 'MEMORY_WARNING',
+      memory: process.memoryUsage()
+    });
+  }
+}, 1000);
+
 
 // Cleanup on exit
 process.on('exit', () => {

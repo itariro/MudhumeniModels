@@ -4,9 +4,12 @@ const booleanValid = require('@turf/boolean-valid');
 const winston = require('winston');
 const { valid } = require('geojson-validation');
 const config = require('../config/config');
+const { default: PQueue } = require('p-queue');
 
-// Configure logger
-// Configure Winston logger
+/**
+ * Configures a Winston logger for recording elevation analysis logs
+ * Logs are written to a file in JSON format at the 'info' log level
+ */
 const logger = winston.createLogger({
     level: 'info',
     format: winston.format.json(),
@@ -17,7 +20,8 @@ const logger = winston.createLogger({
 });
 
 /**
- * Utility class for statistical calculations
+ * Utility class for performing statistical calculations on numeric arrays
+ * Provides methods for computing basic and advanced statistical metrics
  */
 class StatisticsUtils {
     /**
@@ -26,8 +30,11 @@ class StatisticsUtils {
      * @returns {number} - Mean value
      */
     static mean(values) {
-        if (!values.length) throw new Error('Input array cannot be empty');
-        return values.reduce((sum, val) => sum + val, 0) / values.length;
+        let sum = 0;
+        for (let i = 0; i < values.length; i++) {
+            sum += values[i];
+        }
+        return sum / values.length; // Single-pass instead of reduce
     }
 
     /**
@@ -75,39 +82,83 @@ class StatisticsUtils {
     }
 
     /**
- * Calculate confidence interval for an array of values
- * @param {number[]} values - Array of numbers
- * @param {number} confidence - Confidence level (default 0.95)
- * @returns {Object} - Object containing lower and upper bounds
- */
+     * Calculate confidence interval for an array of values
+     * @param {number[]} values - Array of numbers
+     * @param {number} confidence - Confidence level (default 0.95)
+     * @returns {Object} - Object containing lower and upper bounds
+     */
     static confidenceInterval(values, confidence = 0.95) {
-        console.log('Calculating confidence interval...', values);
         if (values.length < 2) {
             throw new Error('Need at least 2 values for confidence interval');
         }
 
-        // Use t-distribution for small samples
+        // Expanded t-table with linear approximation for missing values
         const tTable = {
-            0.95: [12.706, 4.303, 3.182, 2.776, 2.571], // df 1-5
-            0.99: [63.657, 9.925, 5.841, 4.604, 4.032]
+            0.95: [
+                12.706, 4.303, 3.182, 2.776, 2.571, // df 1-5
+                2.447, 2.365, 2.306, 2.262, 2.228,  // df 6-10
+                2.201, 2.179, 2.160, 2.145, 2.131,  // df 11-15
+                2.120, 2.110, 2.101, 2.093, 2.086   // df 16-20
+            ],
+            0.99: [
+                63.657, 9.925, 5.841, 4.604, 4.032,
+                3.707, 3.499, 3.355, 3.250, 3.169,
+                3.106, 3.055, 3.012, 2.977, 2.947,
+                2.921, 2.898, 2.878, 2.861, 2.845
+            ]
         };
 
-        const zScores = { 0.95: 1.96, 0.99: 2.576 };
+        const { mean, variance, count } = this.onePassStats(values);
+        const df = count - 1;
 
-        const df = values.length - 1;
-        const tValue = df <= 5 ? (tTable[confidence]?.[df - 1] || 1.96) : (zScores[confidence] || 1.96);
+        // Calculate t-value
+        let tValue;
+        if (df >= 30) {
+            // Use normal approximation for large samples
+            tValue = confidence === 0.95 ? 1.96 : 2.576;
+        } else if (df <= 20) {
+            tValue = tTable[confidence][df - 1] || 1.96;
+        } else {
+            // Linear interpolation between 20-30 df
+            const base = tTable[confidence][19];
+            tValue = base - (base - 1.96) * ((df - 20) / 10);
+        }
 
-        // Use two-pass algorithm for better numerical stability
-        const mean = this.mean(values);
-        const squaredDiffs = values.map(x => Math.pow(x - mean, 2));
-        const variance = squaredDiffs.reduce((a, b) => a + b) / (values.length - 1);
-        const stdErr = Math.sqrt(variance / values.length);
+        const stdErr = Math.sqrt(variance / count);
 
         return {
-            mean,
+            mean: mean,
             lower: mean - tValue * stdErr,
             upper: mean + tValue * stdErr,
-            confidence
+            confidence: confidence,
+            marginOfError: tValue * stdErr
+        };
+    }
+
+    /**
+     * Calculate mean and variance in single pass
+     * @param {number[]} values 
+     * @returns {Object} {mean, variance, count}
+     */
+    static onePassStats(values) {
+        if (!values.length) throw new Error('Input array cannot be empty');
+
+        let mean = 0;
+        let M2 = 0;
+        let count = 0;
+
+        for (const x of values) {
+            count++;
+            const delta = x - mean;
+            mean += delta / count;
+            const delta2 = x - mean;
+            M2 += delta * delta2;
+        }
+
+        return {
+            mean: mean,
+            variance: M2 / (count - 1),
+            count: count
         };
     }
 }
@@ -119,6 +170,7 @@ class StatisticsUtils {
 class AgriculturalLandAnalyzer {
     // Configuration constants
     static GMRT_API_URL = config.gmrtApiUrl || 'https://www.gmrt.org:443/services/PointServer';
+    static METEO_API_URL = config.meteoApiUrl || 'https://api.open-meteo.com/v1/elevation';
     static EARTH_RADIUS = 6371000; // meters
     static MAX_BATCH_SIZE = 20; // Maximum points per API batch
     static REQUEST_DELAY_MS = 500; // Delay between API batches
@@ -142,11 +194,18 @@ class AgriculturalLandAnalyzer {
         },
         ELEVATION_RANGES: {
             GRAINS: { min: 0, max: 2500 },
-            VEGETABLES: { min: 0, max: 2000 },
-            ORCHARDS: { min: 0, max: 1800 },
-            ROOT_CROPS: { min: 0, max: 1500 }
+            VEGETABLES: { min: 0, max: 3500 },
+            ORCHARDS: { min: 50, max: 1500 },
+            ROOT_CROPS: { min: 0, max: 2000 }
+        },
+        TEMPERATURE_RANGES: {
+            GRAINS: { min: 10, max: 30 },
+            VEGETABLES: { min: 15, max: 25 },
+            ORCHARDS: { min: -5, max: 35 },
+            ROOT_CROPS: { min: 5, max: 20 }
         }
     };
+
 
     static POLYGON_AREA = 0;
     static MIN_SUITABILITY = 0.0;
@@ -158,14 +217,94 @@ class AgriculturalLandAnalyzer {
         MAX: 0
     };
 
+    static #circuitState = {
+        failures: 0,
+        lastFailure: 0,
+        state: 'CLOSED', // CLOSED, OPEN, HALF-OPEN
+        cooldownPeriod: 30000 // 30 seconds
+    };
+
+    static async circuitBreaker() {
+        const now = Date.now();
+
+        if (this.#circuitState.state === 'OPEN') {
+            if (now - this.#circuitState.lastFailure > this.#circuitState.cooldownPeriod) {
+                this.#circuitState.state = 'HALF-OPEN';
+                logger.info('Circuit breaker entering HALF-OPEN state');
+            } else {
+                throw new Error('API unavailable (circuit breaker open)');
+            }
+        }
+
+        this.#circuitState.failures++;
+
+        if (this.#circuitState.failures >= 5) {
+            this.#circuitState.state = 'OPEN';
+            this.#circuitState.lastFailure = Date.now();
+            logger.error('Circuit breaker triggered - OPEN state');
+            throw new Error('API unavailable due to consecutive failures');
+        }
+    }
+
+    static #workerCache = new Map();
+
+    static getOrCreatePersistentWorker() {
+        const { Worker } = require('worker_threads');
+        const path = require('path');
+
+        if (!this.#workerCache.has('persistent')) {
+            const worker = new Worker(path.join(__dirname, '../workers/analysisWorker.js'));
+            this.#workerCache.set('persistent', worker);
+        }
+
+        return this.#workerCache.get('persistent');
+    }
+
+    static async cleanupPersistentWorker() {
+        const worker = this.#workerCache.get('persistent');
+        if (worker) {
+            await worker.terminate();
+            this.#workerCache.delete('persistent');
+        }
+    }
+
     /**
+     * Optimize data structures for memory efficiency
+     * @param {Object} data - Data to optimize
+     * @returns {Object} Optimized data
+     */
+    static optimizeForMemory(data) {
+        if (!data) return data;
+
+        // Use TypedArrays for coordinate data
+        if (data.coordinates) {
+            const flattened = data.coordinates.flat();
+            data.coordinates = new Float64Array(flattened);
+        }
+
+        // Remove unnecessary properties
+        const propsToDelete = ['metadata', 'cache', '_cache', 'tempData'];
+        propsToDelete.forEach(prop => {
+            if (data[prop]) delete data[prop];
+        });
+
+        // Optimize nested structures
+        if (data.features) {
+            data.features = data.features.map(feature => this.optimizeForMemory(feature));
+        }
+
+        return data;
+    }
+
+    /**
+     * Analyze an area defined by a GeoJSON polygon
      * Analyze an area defined by a GeoJSON polygon
      * @param {Object} geoJson - GeoJSON polygon defining the area
      * @returns {Promise<Object>} - Comprehensive analysis results
      */
     static async analyzeArea(geoJson) {
         try {
-            logger.info('Starting analysis for GeoJSON area');
+            logger.info('Starting analysis for GeoJSON area...');
 
             // Validate GeoJSON input
             if (!this.validateGeoJSON(geoJson)) {
@@ -173,15 +312,21 @@ class AgriculturalLandAnalyzer {
             }
 
             // Generate sampling points within the polygon
+            console.log('Generating sampling points...');
             const samplingPoints = this.generateSamplingPoints(geoJson);
 
             // Fetch elevation data for all points
+            console.log('Fetching elevation data...');
             const elevationData = await this.fetchElevationData(samplingPoints);
-            if (elevationData.length < 2) {
-                logger.warn(`Insufficient elevation data: ${elevationData.length} valid points`);
-            }
 
-            const elevations = this.extractElevations(elevationData);
+            const transformedElevationData = this.transformElevationData(elevationData);
+            console.log('Transformed elevation data...');
+
+            const elevations = elevationData
+                .filter(item => item.status === "fulfilled")
+                .flatMap(item => item.value.elevation);
+            console.log('Elevations:', elevations);
+
             const { mean, median, min, max } = StatisticsUtils;
 
             this.FIELD_ELEVATION = {
@@ -190,13 +335,14 @@ class AgriculturalLandAnalyzer {
                 MIN: parseFloat(min(elevations)),
                 MAX: parseFloat(max(elevations))
             };
-            console.log('Elevation data:', elevationData);
+
+            console.log('Field elevation data:', this.FIELD_ELEVATION);
 
             // Perform comprehensive analysis
-            const analysis = await this.performAnalysis(geoJson, elevationData);
+            const analysis = await this.performAnalysis(geoJson, transformedElevationData);
             console.log('Analysis:', analysis);
 
-            logger.info('Analysis completed successfully');
+            logger.info('Analysis completed successfully...');
             return analysis;
         } catch (error) {
             logger.error('Error in area analysis:', error);
@@ -205,12 +351,27 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
-     * Extract the elevation values from the provided data.
-     * @param {Object[]} data - An array of data objects, each containing an 'elevation' property.
-     * @returns {number[]} - An array of elevation values extracted from the input data.
+     * Transforms raw elevation data into a structured array of elevation points
+     * @param {Array} data - Raw elevation data from API response
+     * @returns {Array} An array of objects with elevation and coordinate information
      */
-    static extractElevations(data) {
-        return data.map(item => item.elevation);
+    static transformElevationData(data) {
+        if (data[0].status === "fulfilled") {
+            const { elevation, coordinates } = data[0].value;
+
+            // Split the single string in lon and lat into actual arrays
+            const lonArray = coordinates.lon[0].split(',').map(parseFloat);
+            const latArray = coordinates.lat[0].split(',').map(parseFloat);
+
+            return elevation.map((ele, index) => ({
+                elevation: ele,
+                coordinates: {
+                    lon: lonArray[index],
+                    lat: latArray[index]
+                }
+            }));
+        }
+        return [];
     }
 
     /**
@@ -245,23 +406,32 @@ class AgriculturalLandAnalyzer {
      * @returns {Object} - GeoJSON FeatureCollection of points
      */
     static generateSamplingPoints(geoJson) {
-        if (!turf.booleanValid(geoJson)) {
-            throw new Error('Invalid GeoJSON input');
-        }
-
         const area = turf.area(geoJson);
-        const MAX_POINTS_PER_CHUNK = 1000;
-        const GRID_SPACING = 10; // 10 meters
+        const MAX_POINTS = 5000;
 
-        if (area > 1000000) { // 1 km²
-            const chunks = this.divideIntoChunks(geoJson);
-            return chunks.reduce((points, chunk) => {
-                const chunkPoints = this.generateGridPoints(chunk, GRID_SPACING, MAX_POINTS_PER_CHUNK);
-                return turf.featureCollection([...points.features, ...chunkPoints.features]);
-            }, turf.featureCollection([]));
+        // Calculate adaptive spacing with floor at 10 meters
+        const spacing = Math.max(10, Math.sqrt(area / MAX_POINTS));
+
+        // Generate hex grid with calculated spacing
+        const grid = turf.pointGrid(
+            turf.bbox(geoJson),
+            spacing,
+            { units: 'meters', gridType: 'hex' }
+        );
+
+        // Filter to points actually inside the polygon
+        const filtered = turf.pointsWithinPolygon(grid, geoJson);
+
+        // Enforce maximum point count with stratified sampling
+        if (filtered.features.length > MAX_POINTS) {
+            return turf.sample(
+                filtered,
+                MAX_POINTS,
+                { propertyName: 'sampleWeight' }
+            );
         }
 
-        return this.generateGridPoints(geoJson, GRID_SPACING, MAX_POINTS_PER_CHUNK);
+        return filtered;
     }
 
     static generateGridPoints(polygon, spacing, maxPoints) {
@@ -314,72 +484,32 @@ class AgriculturalLandAnalyzer {
      * @returns {Promise<Object[]>} - Array of elevation data objects
      */
     static async fetchElevationData(points) {
-        // Input validation
-        if (!points?.features?.length) {
-            throw new Error('Invalid points input: Empty or missing features array');
-        }
+        const queue = new PQueue({
+            concurrency: 8,
+            interval: 1000,
+            intervalCap: 50
+        });
 
-        const coordinates = points.features.map(f => f.geometry.coordinates);
-        const results = [];
-        const total = coordinates.length;
+        const coordinates_list_lat = [];
+        const coordinates_list_lon = [];
+        points.features.forEach(f => {
+            coordinates_list_lon.push(f.geometry.coordinates[0]);
+            coordinates_list_lat.push(f.geometry.coordinates[1]);
+        });
 
-        // Dynamic batch size calculation
-        const batchSize = this.getBatchSize(total);
-
-        // Exponential backoff configuration
-        const maxRetries = 3;
-        const backoff = (attempt) => this.REQUEST_DELAY_MS * Math.pow(2, attempt);
-
-        logger.info(`Starting elevation data fetch for ${total} points`);
-
-        for (let i = 0; i < coordinates.length; i += batchSize) {
-            const batch = coordinates.slice(i, i + batchSize);
-
-            // Progress tracking
-            const progress = Math.round((i / total) * 100);
-            logger.info(`Elevation data fetch progress: ${progress}%`);
-
-            // Implement retry with backoff
-            let attempt = 0;
-            let batchResults;
-
-            while (attempt < maxRetries) {
-                try {
-                    await new Promise(resolve => setTimeout(resolve, backoff(attempt)));
-                    const batchPromises = batch.map(coord =>
-                        this.fetchSinglePointElevation(coord[1], coord[0])
-                    );
-                    batchResults = await Promise.allSettled(batchPromises);
-                    break;
-                } catch (error) {
-                    attempt++;
-                    logger.warn(`Batch retry ${attempt}/${maxRetries} due to: ${error.message}`);
-                    if (attempt === maxRetries) {
-                        logger.error(`Failed to fetch batch after ${maxRetries} attempts`);
-                        throw error;
-                    }
-                }
-            }
-            results.push(...batchResults.map(r => r.status === 'fulfilled' ? r.value : null));
-        }
-
-        // Calculate and log success statistics
-        const validResults = results.filter(r => r !== null);
-        const successRate = (validResults.length / results.length) * 100;
-
-        logger.info(`Elevation fetch complete: ${successRate.toFixed(2)}% success rate`);
-        logger.info(`Retrieved ${validResults.length} valid elevation points out of ${results.length} total`);
-
-        return validResults;
+        const coordinates_list_ = [{ lat: JSON.stringify(coordinates_list_lat).slice(1, -1), long: JSON.stringify(coordinates_list_lon).slice(1, -1) }];
+        return Promise.allSettled(
+            coordinates_list_.map(f => queue.add(() =>
+                this.fetchSinglePointElevation(f.long, f.lat)
+            ))
+        );
     }
 
     // Helper method for dynamic batch size calculation
     static getBatchSize(total) {
-        const OPTIMAL_BATCHES = 10;
-        return Math.min(
-            this.MAX_BATCH_SIZE,
-            Math.ceil(total / OPTIMAL_BATCHES)
-        );
+        const API_CAPACITY = 100; // Requests/second
+        const TARGET_TIME = total / API_CAPACITY;
+        return Math.min(100, Math.ceil(total / TARGET_TIME));
     }
 
     /**
@@ -388,30 +518,44 @@ class AgriculturalLandAnalyzer {
      * @param {number} lon - Longitude
      * @returns {Promise<Object>} - Elevation data object
      */
-    static async fetchSinglePointElevation(lat, lon) {
-        // Add input validation
-        if (!this.isValidCoordinate(lat, lon)) {
-            throw new Error('Invalid coordinates');
-        }
-
-        // Add retry mechanism
-        let retries = 3;
-        while (retries > 0) {
+    static async fetchSinglePointElevation(lon, lat) {
+        let lastError = null;
+        for (let attempt = 1; attempt <= 5; attempt++) {
             try {
-                const response = await axios.get(`${this.GMRT_API_URL}?longitude=${lon}&latitude=${lat}&format=json`, { timeout: 5000 });
+                const response = await axios.get(`${this.METEO_API_URL}?longitude=${lon}&latitude=${lat}&format=json`, {
+                    timeout: 3000,
+                    headers: { 'Retry-After': attempt * 1000 }
+                });
+
                 if (!response.data?.elevation) {
                     throw new Error('Invalid elevation data');
                 }
+
                 return {
-                    coordinates: [lon, lat],
-                    elevation: parseFloat(response.data.elevation)
+                    coordinates: { lon: [lon], lat: [lat] },
+                    elevation: response.data.elevation
                 };
             } catch (error) {
-                retries--;
-                if (retries === 0) throw error;
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                lastError = error;
+                if (error.response?.status === 429) {
+                    await this.circuitBreaker();
+                }
+                // Continue to next retry attempt
+                continue;
             }
         }
+        // If all retries failed, throw the last error
+        throw new Error(`Failed to fetch elevation data after 5 attempts: ${lastError?.message || 'Unknown error'}`);
+    }
+
+    static validateElevation(data, lon, lat) {
+        if (!data?.elevation || data.elevation < -11000 || data.elevation > 9000) {
+            throw new Error(`Invalid elevation: ${data.elevation}`);
+        }
+        return {
+            coordinates: [lon, lat],
+            elevation: parseFloat(data.elevation)
+        };
     }
 
     /**
@@ -449,57 +593,329 @@ class AgriculturalLandAnalyzer {
         return true;
     }
 
+
     /**
-     * Perform comprehensive analysis of the area
-     * @param {Object} geoJson - GeoJSON polygon
-     * @param {Object[]} elevationData - Array of elevation data objects
-     * @returns {Promise<Object>} - Analysis results
+     * Performs comprehensive geospatial and terrain analysis for a given geographic area
+     * @param {Object} geoJson - GeoJSON representation of the area to analyze
+     * @param {Array} elevationData - Collection of elevation data points
+     * @returns {Object} Detailed analysis including area characteristics, terrain analysis, crop suitability, ROI factors, and recommendations
+     */
+    // static async performAnalysis(geoJson, elevationData) {
+    //     console.log('elevationData:', elevationData);
+    //     const area = turf.area(geoJson);
+    //     this.POLYGON_AREA = area;
+    //     const points = elevationData.map(d => ({
+    //         type: 'Feature',
+    //         geometry: {
+    //             type: 'Point',
+    //             coordinates: d.value.coordinates
+    //         },
+    //         properties: {
+    //             elevation: d.value.elevation
+    //         }
+    //     }));
+
+    //     elevationData.forEach(d => {
+    //         const { coordinates, elevation } = d.value;
+    //         console.log('Coordinates:', coordinates);
+    //         console.log('Elevation:', elevation);
+    //     });
+
+    //     // Create elevation surface for analysis
+    //     const elevationSurface = turf.tin(turf.featureCollection(points), 'elevation');
+    //     console.log('Elevation surface:',  elevationSurface);
+
+    //     // Calculate slope statistics
+    //     const slopeStats = this.calculateSlopeStatistics(elevationSurface);
+    //     console.log('Slope stats:', slopeStats);
+    //     // Analyze terrain characteristics
+    //     const terrainAnalysis = this.analyzeTerrainCharacteristics(elevationSurface, slopeStats);
+    //     console.log('Terrain analysis:', terrainAnalysis);
+    //     // Assess crop suitability
+    //     const cropSuitability = this.assessCropSuitability(slopeStats, terrainAnalysis);
+    //     console.log('Crop suitability:', cropSuitability);
+    //     // Calculate ROI factors
+    //     const roiAnalysis = this.calculateROIFactors(area, slopeStats, terrainAnalysis);
+    //     console.log('ROI analysis:', roiAnalysis);
+    //     return {
+    //         areaCharacteristics: {
+    //             totalArea: area,
+    //             elevationRange: {
+    //                 min: Math.min(...elevationData.map(d => d.value.elevation)),
+    //                 max: Math.max(...elevationData.map(d => d.value.elevation)),
+    //                 mean: StatisticsUtils.mean(elevationData.map(d => d.value.elevation))
+    //             },
+    //             slope: slopeStats
+    //         },
+    //         terrainAnalysis,
+    //         cropSuitability,
+    //         roiAnalysis,
+    //         recommendations: this.generateRecommendations(cropSuitability, roiAnalysis)
+    //     };
+    // }
+
+    /**
+     * Performs comprehensive geospatial and terrain analysis using worker threads
+     * @param {Object} geoJson - GeoJSON representation of the area to analyze
+     * @param {Array} elevationData - Collection of elevation data points
+     * @returns {Promise<Object>} Detailed analysis results
      */
     static async performAnalysis(geoJson, elevationData) {
-        const area = turf.area(geoJson);
-        this.POLYGON_AREA = area;
-        const points = elevationData.map(d => ({
-            type: 'Feature',
-            geometry: {
-                type: 'Point',
-                coordinates: d.coordinates
-            },
-            properties: {
-                elevation: d.elevation
-            }
-        }));
+        const { performance } = require('perf_hooks');
 
-        // Create elevation surface for analysis
-        const elevationSurface = turf.tin(turf.featureCollection(points), 'elevation');
-        console.log('Elevation surface:', elevationSurface);
+        // Start performance monitoring
+        const startTime = performance.now();
+        const logger = this.logger || console;
 
-        // Calculate slope statistics
-        const slopeStats = this.calculateSlopeStatistics(elevationSurface);
-        console.log('Slope stats:', slopeStats);
-        // Analyze terrain characteristics
-        const terrainAnalysis = this.analyzeTerrainCharacteristics(elevationSurface, slopeStats);
-        console.log('Terrain analysis:', terrainAnalysis);
-        // Assess crop suitability
-        const cropSuitability = this.assessCropSuitability(slopeStats, terrainAnalysis);
-        console.log('Crop suitability:', cropSuitability);
-        // Calculate ROI factors
-        const roiAnalysis = this.calculateROIFactors(area, slopeStats, terrainAnalysis);
-        console.log('ROI analysis:', roiAnalysis);
-        return {
-            areaCharacteristics: {
-                totalArea: area,
-                elevationRange: {
-                    min: Math.min(...elevationData.map(d => d.elevation)),
-                    max: Math.max(...elevationData.map(d => d.elevation)),
-                    mean: StatisticsUtils.mean(elevationData.map(d => d.elevation))
+        try {
+            logger.info('Starting parallel analysis processing...');
+
+            const area = turf.area(geoJson);
+            this.POLYGON_AREA = area;
+
+            // 1. Prepare elevation data points
+            const points = elevationData.map(d => ({
+                type: 'Feature',
+                geometry: {
+                    type: 'Point',
+                    coordinates: [d.coordinates.lon, d.coordinates.lat]
                 },
-                slope: slopeStats
-            },
-            terrainAnalysis,
-            cropSuitability,
-            roiAnalysis,
-            recommendations: this.generateRecommendations(cropSuitability, roiAnalysis)
+                properties: {
+                    elevation: d.elevation
+                }
+            }));
+
+            // 2. Create elevation surface (lightweight operation in main thread)
+            const elevationSurface = turf.tin(turf.featureCollection(points), 'elevation');
+
+            // 3. Prepare worker data with proper serialization
+            const workerData = {
+                elevationSurface: this.serializeForWorker(elevationSurface),
+                POLYGON_AREA: this.POLYGON_AREA,
+                FIELD_ELEVATION: this.FIELD_ELEVATION,
+                config: {
+                    SLOPE_CLASSES: this.SLOPE_CLASSES,
+                    CROP_FACTORS: this.CROP_FACTORS
+                }
+            };
+
+            // 4. Execute parallel analysis
+            const [slopeStats, terrainAnalysis] = await this.executeParallelAnalysis(workerData);
+
+            // 5. Parallelize remaining calculations
+            const [cropSuitability, roiAnalysis] = await Promise.all([
+                this.assessCropSuitability(slopeStats, terrainAnalysis),
+                this.calculateROIFactors(this.POLYGON_AREA, slopeStats, terrainAnalysis)
+            ]);
+
+            // 6. Compile final results
+            const results = {
+                areaCharacteristics: {
+                    totalArea: this.POLYGON_AREA,
+                    elevationRange: {
+                        min: Math.min(...elevationData.map(d => d.value.elevation)),
+                        max: Math.max(...elevationData.map(d => d.value.elevation)),
+                        mean: StatisticsUtils.mean(elevationData.map(d => d.value.elevation))
+                    },
+                    slope: slopeStats
+                },
+                terrainAnalysis,
+                cropSuitability,
+                roiAnalysis,
+                recommendations: this.generateRecommendations(cropSuitability, roiAnalysis),
+                performance: {
+                    processingTime: `${(performance.now() - startTime).toFixed(2)}ms`,
+                    parallelOperations: 3 // slope, terrain, and combined analyses
+                }
+            };
+
+            logger.info(`Analysis completed in ${results.performance.processingTime}`);
+            return results;
+
+        } catch (error) {
+            logger.error('Analysis failed:', error);
+            throw new Error(`Parallel analysis failed: ${error.message}`);
+        }
+    }
+
+    /**
+     * Helper method to execute parallel analysis in worker threads
+     * @param {Object} workerData - Prepared data for worker
+     * @returns {Promise<Array>} [slopeStats, terrainAnalysis]
+     */
+    static async executeParallelAnalysis(workerData) {
+        const { Worker } = require('worker_threads');
+        const path = require('path');
+        const os = require('os');
+
+        if (!workerData?.elevationSurface?.features?.length) {
+            return Promise.resolve({
+                slopeStats: null,
+                terrainAnalysis: null,
+                performance: { chunkTimes: [], totalTime: 0, memory: null }
+            });
+        }
+
+        // Determine optimal number of workers
+        const MAX_WORKERS = Math.max(1, Math.min(os.cpus().length - 1, 4));
+        const features = workerData.elevationSurface.features;
+        const CHUNK_SIZE = Math.ceil(features.length / MAX_WORKERS);
+
+        return new Promise((resolve, reject) => {
+            const workers = new Map();
+            const results = [];
+            let completedWorkers = 0;
+            let hasError = false;
+
+            // Create and track timeouts
+            const timeouts = new Map();
+
+            // Cleanup function
+            const cleanup = async () => {
+                for (const worker of workers.keys()) {
+                    try {
+                        await worker.terminate();
+                    } catch (err) {
+                        console.warn(`Failed to terminate worker: ${err.message}`);
+                    }
+                }
+                for (const timeout of timeouts.values()) {
+                    clearTimeout(timeout);
+                }
+            };
+
+            // Process chunks with workers
+            for (let i = 0; i < MAX_WORKERS; i++) {
+                const start = i * CHUNK_SIZE;
+                const end = Math.min(start + CHUNK_SIZE, features.length);
+
+                if (start >= features.length) break;
+
+                const chunkData = {
+                    ...workerData,
+                    elevationSurface: {
+                        ...workerData.elevationSurface,
+                        features: features.slice(start, end)
+                    }
+                };
+
+                const worker = new Worker(path.join(__dirname, '../workers/analysisWorker.js'));
+                workers.set(worker, { busy: true, index: i });
+
+                const safelyReject = async (reason) => {
+                    if (hasError) return;
+                    hasError = true;
+                    await cleanup();
+                    reject(reason);
+                };
+
+                // Set timeout for this worker
+                const timeout = setTimeout(async () => {
+                    worker.terminate();
+                    await safelyReject(new Error(`Worker ${i} timeout exceeded (300s)`));
+                }, 300000);
+
+                timeouts.set(worker, timeout);
+
+                worker.on('message', async (result) => {
+                    clearTimeout(timeouts.get(worker));
+
+                    if (result.success) {
+                        results[i] = result;
+                        completedWorkers++;
+                        if (completedWorkers === Math.min(MAX_WORKERS, Math.ceil(features.length / CHUNK_SIZE))) {
+                            await cleanup();
+                            resolve(this.mergeWorkerResults(results));
+                        }
+                    } else {
+                        await safelyReject(new Error(`Worker ${i} error: ${result.error.message}`));
+                    }
+                });
+
+                worker.on('error', async (error) => await safelyReject(error));
+                worker.on('exit', async (code) => {
+                    if (code !== 0) {
+                        await safelyReject(new Error(`Worker ${i} exited with code ${code}`));
+                    }
+                });
+
+                worker.on('error', async (error) => {
+                    await safelyReject(new Error(`Worker ${i} error: ${error.message}`));
+                });
+
+                worker.on('exit', async (code) => {
+                    if (code !== 0) {
+                        hasError = true;
+                        cleanup();
+                        await safelyReject(new Error(`Worker ${i} stopped with exit code ${code}`));
+                    }
+                });
+
+                worker.postMessage(chunkData);
+            }
+        });
+    }
+
+    // Helper function to merge worker results
+    static mergeWorkerResults(results) {
+        return results.reduce((acc, result) => {
+            if (!acc) return result;
+            return {
+                slopeStats: this.combineStats(acc.slopeStats, result.slopeStats),
+                terrainAnalysis: this.combineTerrainAnalysis(acc.terrainAnalysis, result.terrainAnalysis),
+                performance: {
+                    chunkTimes: [...acc.performance.chunkTimes, ...result.performance.chunkTimes],
+                    totalTime: acc.performance.totalTime + result.performance.totalTime
+                }
+            };
+        });
+    }
+
+    /**
+     * Optimized serialization for worker thread communication
+     * @param {Object} elevationSurface - TIN elevation surface
+     * @returns {Object} Serialized data
+     */
+    static serializeForWorker(elevationSurface) {
+        // Ensure proper serialization of TypedArrays
+        return {
+            type: 'FeatureCollection',
+            features: elevationSurface.features.map(f => ({
+                type: 'Feature',
+                properties: { ...f.properties },
+                geometry: {
+                    type: 'Polygon',
+                    coordinates: Array.isArray(f.geometry.coordinates[0]) ?
+                        f.geometry.coordinates[0] :
+                        Array.from(f.geometry.coordinates[0]) // Convert TypedArray if needed
+                }
+            }))
         };
+    }
+
+    /**
+     * Static initialization block for graceful worker cleanup
+     * Handles process exit and interrupt signals to ensure proper worker termination
+     */
+    static {
+        // Update the process handlers
+        process.on('exit', () => {
+            try {
+                this.cleanupPersistentWorker();
+            } catch (err) {
+                console.error('Error during cleanup:', err);
+            }
+        });
+
+        process.on('SIGINT', () => {
+            console.log('Received SIGINT. Cleaning up...');
+            try {
+                this.cleanupPersistentWorker();
+            } catch (err) {
+                console.error('Error during SIGINT cleanup:', err);
+            }
+            process.exit(0);
+        });
     }
 
     /**
@@ -508,28 +924,55 @@ class AgriculturalLandAnalyzer {
      * @returns {Object} - Slope statistics
      */
     static calculateSlopeStatistics(elevationSurface) {
-        const slopes = [];
-        // Calculate slopes between all adjacent points in TIN
-        console.log('Calculate slopes between all adjacent points in TIN...');
+        // Use pre-allocated arrays for better performance
+        console.log('Calculating slope statistics...');
+        const slopes = new Float32Array(elevationSurface.features.length * 3);
+        let slopeIndex = 0;
+
+        // Optimized loop with pre-calculated values
+        const toRadians = Math.PI / 180;
+        const toDegrees = 180 / Math.PI;
+
         elevationSurface.features.forEach(triangle => {
             const coords = triangle.geometry.coordinates[0];
+            const props = triangle.properties;
+
+            console.log('triangle');
+
             for (let i = 0; i < 3; i++) {
-                const slope = this.calculateSlopeBetweenPoints(
-                    coords[i],
-                    coords[(i + 1) % 3],
-                    triangle.properties
+                const p1 = coords[i];
+                const p2 = coords[(i + 1) % 3];
+
+                // Calculate distance once
+                const distance = turf.distance(
+                    turf.point(p1),
+                    turf.point(p2),
+                    { units: 'meters' }
+                ) * 1.02; // vertical adjustment factor
+
+                // Calculate elevation difference
+                const elevDiff = Math.abs(props.a - props.b);
+
+                // Calculate slope and store
+                slopes[slopeIndex++] = Math.max(
+                    0.1, // min slope threshold
+                    Math.atan2(elevDiff, distance) * toDegrees
                 );
-                slopes.push(slope);
             }
         });
-        console.log('Slope stats:', slopes);
-        const slopeConfidence = StatisticsUtils.confidenceInterval(slopes);
+
+        // Create a view of only the used portion of the array
+        const validSlopes = slopes.slice(0, slopeIndex);
+        console.log('validSlopes:', validSlopes);
+
+        // Calculate statistics using optimized methods
+        const slopeConfidence = StatisticsUtils.confidenceInterval(validSlopes);
         return {
-            mean: StatisticsUtils.mean(slopes),
-            median: StatisticsUtils.median(slopes),
-            stdDev: StatisticsUtils.stdDev(slopes),
+            mean: StatisticsUtils.mean(validSlopes),
+            median: StatisticsUtils.median(validSlopes),
+            stdDev: StatisticsUtils.stdDev(validSlopes),
             confidence: slopeConfidence,
-            distribution: this.calculateSlopeDistribution(slopes),
+            distribution: this.calculateSlopeDistribution(validSlopes),
             aspectAnalysis: this.analyzeAspects(elevationSurface)
         };
     }
@@ -541,12 +984,33 @@ class AgriculturalLandAnalyzer {
      * @returns {Object} - Terrain analysis results
      */
     static analyzeTerrainCharacteristics(elevationSurface, slopeStats) {
+        // Run analyses in parallel where possible
+        const [drainage, solarExposure] = [
+            this.analyzeDrainage(elevationSurface),
+            this.analyzeSolarExposure(elevationSurface)
+        ];
+
         return {
-            drainage: this.analyzeDrainage(elevationSurface),
+            drainage,
             erosionRisk: this.calculateErosionRisk(slopeStats),
             waterRetention: this.calculateWaterRetention(slopeStats),
-            solarExposure: this.analyzeSolarExposure(elevationSurface),
+            solarExposure,
             terrainComplexity: this.calculateTerrainComplexity(elevationSurface)
+        };
+    }
+
+    // Optimized drainage analysis
+    static analyzeDrainage(elevationSurface) {
+        // Use memoization to avoid recalculating flow accumulation
+        if (!this._flowAccumulationCache) {
+            this._flowAccumulationCache = this.calculateFlowAccumulation(elevationSurface);
+        }
+
+        const flowAccumulation = this._flowAccumulationCache;
+        return {
+            drainagePattern: this.classifyDrainagePattern(flowAccumulation),
+            drainageDensity: this.calculateDrainageDensity(flowAccumulation),
+            waterloggingRisk: this.assessWaterloggingRisk(flowAccumulation)
         };
     }
 
@@ -558,14 +1022,49 @@ class AgriculturalLandAnalyzer {
      */
     static assessCropSuitability(slopeStats, terrainAnalysis) {
         const suitability = {};
+        const cropTypes = Object.keys(this.CROP_FACTORS.SLOPE_WEIGHTS);
 
-        for (const [cropType, factors] of Object.entries(this.CROP_FACTORS.SLOPE_WEIGHTS)) {
-            suitability[cropType] = this.calculateCropSuitabilityScore(
-                cropType,
-                slopeStats,
-                terrainAnalysis
+        // Pre-calculate common factors
+        const commonFactors = {
+            drainageAdjustment: 1 - (terrainAnalysis.drainage.waterloggingRisk * 0.5),
+            erosionAdjustment: 1 - (terrainAnalysis.erosionRisk.score * 0.3)
+        };
+
+        // Process crops in parallel (simulated with Promise.all)
+        const results = cropTypes.map(cropType => {
+            const weights = this.CROP_FACTORS.SLOPE_WEIGHTS[cropType];
+            const elevRange = this.CROP_FACTORS.ELEVATION_RANGES[cropType];
+
+            const slopeSuitability = this.calculateSlopeSuitability(slopeStats.mean, weights);
+            const elevationSuitability = this.calculateElevationSuitability(
+                this.FIELD_ELEVATION.MEAN,
+                elevRange
             );
-        }
+
+            const score = slopeSuitability *
+                elevationSuitability *
+                commonFactors.drainageAdjustment *
+                commonFactors.erosionAdjustment;
+
+            return {
+                cropType,
+                result: {
+                    score,
+                    category: this.classifySuitability(score),
+                    factors: {
+                        slopeSuitability,
+                        elevationSuitability,
+                        drainageAdjustment: commonFactors.drainageAdjustment,
+                        erosionAdjustment: commonFactors.erosionAdjustment
+                    }
+                }
+            };
+        });
+
+        // Convert results to object
+        results.forEach(({ cropType, result }) => {
+            suitability[cropType] = result;
+        });
 
         return {
             scores: suitability,
@@ -592,12 +1091,12 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
- * Get neighboring cells for a given cell index
- * @param {number} cellIndex - Index of the current cell
- * @param {number} rows - Number of rows in the grid
- * @param {number[]} cells - Array of cell elevation values
- * @returns {Array<{index: number, elevation: number}>} Array of neighbor objects
- */
+     * Get neighboring cells for a given cell index
+     * @param {number} cellIndex - Index of the current cell
+     * @param {number} rows - Number of rows in the grid
+     * @param {number[]} cells - Array of cell elevation values
+     * @returns {Array<{index: number, elevation: number}>} Array of neighbor objects
+     */
     static getNeighbors(cellIndex, rows, cells) {
         const row = Math.floor(cellIndex / rows);
         const col = cellIndex % rows;
@@ -680,40 +1179,9 @@ class AgriculturalLandAnalyzer {
      * @param {Object} geoJson - Input GeoJSON polygon
      * @returns {Array<Object>} Array of smaller GeoJSON polygons
      */
-    static divideIntoChunks(geoJson) {
-        const bbox = turf.bbox(geoJson);
-        const width = bbox[2] - bbox[0];
-        const height = bbox[3] - bbox[1];
-        const chunks = [];
-
-        // Determine chunk size based on area
-        const area = turf.area(geoJson);
-        const numChunks = Math.ceil(area / 1000000); // 1 km² chunks
-        const chunksPerSide = Math.ceil(Math.sqrt(numChunks));
-
-        const chunkWidth = width / chunksPerSide;
-        const chunkHeight = height / chunksPerSide;
-
-        // Generate grid of chunks
-        for (let i = 0; i < chunksPerSide; i++) {
-            for (let j = 0; j < chunksPerSide; j++) {
-                const chunkBbox = [
-                    bbox[0] + (i * chunkWidth),
-                    bbox[1] + (j * chunkHeight),
-                    bbox[0] + ((i + 1) * chunkWidth),
-                    bbox[1] + ((j + 1) * chunkHeight)
-                ];
-
-                const chunk = turf.bboxPolygon(chunkBbox);
-                const intersection = turf.intersect(geoJson, chunk);
-
-                if (intersection && turf.area(intersection) > 0) {
-                    chunks.push(intersection);
-                }
-            }
-        }
-
-        return chunks;
+    static divideIntoChunks(polygon) {
+        return turf.hexGrid(turf.bbox(polygon), 0.1, { units: 'degrees' })
+            .features.filter(c => turf.booleanIntersects(c, polygon));
     }
 
     /**
@@ -784,30 +1252,49 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
- * Calculate slope distribution across classes
- * @param {number[]} slopes - Array of slope values in degrees
- * @returns {Object.<string, {percentage: number, area: number, description: string}>} 
- * @throws {Error} If slopes input is invalid
- */
-    static #slopeDistributionCache = new WeakMap();
+     * Calculate slope distribution across classes
+     * @param {number[]} slopes - Array of slope values in degrees
+     * @returns {Object.<string, {percentage: number, area: number, description: string}>} 
+     * @throws {Error} If slopes input is invalid
+     */
+
+    static #slopeDistributionCache = new Map();
+    static #MAX_CACHE_SIZE = 100;
+
+    // Then add this method to manage the cache size
+    static limitCacheSize() {
+        if (this.#slopeDistributionCache.size > this.#MAX_CACHE_SIZE) {
+            // Remove oldest entries (first 20% of entries)
+            const entriesToRemove = Math.ceil(this.#MAX_CACHE_SIZE * 0.2);
+            const keys = Array.from(this.#slopeDistributionCache.keys()).slice(0, entriesToRemove);
+            keys.forEach(key => this.#slopeDistributionCache.delete(key));
+        }
+    }
 
     static calculateSlopeDistribution(slopes) {
         // Input validation
-        if (!Array.isArray(slopes) || slopes.length === 0) {
+        if (!Array.isArray(slopes) && !ArrayBuffer.isView(slopes)) {
+            throw new Error(`Invalid slopes input: Expected array, got ${typeof slopes}`);
+        }
+
+        if (slopes.length === 0) {
             throw new Error('Invalid slopes input: Must be non-empty array');
         }
 
-        // Check cache
-        const cacheKey = slopes;
+        // Convert to regular array if it's a TypedArray
+        const slopesArray = ArrayBuffer.isView(slopes) ? Array.from(slopes) : slopes;
+
+        // Use a string-based cache key instead of the array reference
+        const cacheKey = JSON.stringify(slopesArray);
         if (this.#slopeDistributionCache.has(cacheKey)) {
             return this.#slopeDistributionCache.get(cacheKey);
         }
 
-        const total = slopes.length;
+        const total = slopesArray.length;
 
         // Single-pass counting
         const counts = new Map();
-        const sortedSlopes = [...slopes].sort((a, b) => a - b);
+        const sortedSlopes = [...slopesArray].sort((a, b) => a - b);
 
         sortedSlopes.forEach(slope => {
             for (const [className, limits] of Object.entries(this.SLOPE_CLASSES)) {
@@ -829,14 +1316,13 @@ class AgriculturalLandAnalyzer {
             return acc;
         }, {});
 
-        // Cache results
+        // Cache results with string key
         this.#slopeDistributionCache.set(cacheKey, Object.freeze(distribution));
+        this.limitCacheSize(); // Add this line
 
-        logger.info('Slope distribution calculated', { distribution });
-
+        logger.info('Slope distribution calculated...');
         return distribution;
     }
-
 
     /**
      * Analyze aspects (slope direction) of the terrain
@@ -874,20 +1360,6 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
-     * Analyze drainage patterns
-     * @param {Object} elevationSurface - TIN elevation surface
-     * @returns {Object} - Drainage analysis results
-     */
-    static analyzeDrainage(elevationSurface) {
-        const flowAccumulation = this.calculateFlowAccumulation(elevationSurface);
-        return {
-            drainagePattern: this.classifyDrainagePattern(flowAccumulation),
-            drainageDensity: this.calculateDrainageDensity(flowAccumulation),
-            waterloggingRisk: this.assessWaterloggingRisk(flowAccumulation)
-        };
-    }
-
-    /**
      * Calculate flow accumulation
      * @param {Object} elevationSurface - TIN elevation surface
      * @returns {Object} - Flow accumulation grid
@@ -896,15 +1368,16 @@ class AgriculturalLandAnalyzer {
         // Simplified D8 flow algorithm
         console.log('Calculating flow accumulation...');
         const cells = this.convertToGrid(elevationSurface);
+        console.log('Converted to grid');
         logger.info(cells);
         return this.d8FlowAccumulation(cells);
     }
 
     /**
- * Classify the drainage pattern based on flow accumulation
- * @param {Object} flowAccumulation - Flow accumulation grid
- * @returns {string} - Drainage pattern classification
- */
+     * Classify the drainage pattern based on flow accumulation
+     * @param {Object} flowAccumulation - Flow accumulation grid
+     * @returns {string} - Drainage pattern classification
+     */
     static classifyDrainagePattern(flowAccumulation) {
         const features = flowAccumulation.features;
         const totalCells = features.length;
@@ -965,184 +1438,97 @@ class AgriculturalLandAnalyzer {
     }
 
     /**
-     * Converts a TIN elevation surface to a regular grid with optimized resolution
+     * Convert TIN to regular grid
      * @param {Object} elevationSurface - TIN elevation surface
-     * @param {number} [targetCells=25] - Target number of cells (default 5x5=25)
-     * @returns {Object} - Regular grid with interpolated elevation values
+     * @returns {Object} - Regular grid
      */
-    static convertToGrid(elevationSurface, targetCells = 25) {
-        // Input validation
-        if (!elevationSurface || !elevationSurface.features || elevationSurface.features.length === 0) {
-            logger.warn('Invalid elevation surface provided to convertToGrid');
-            return turf.featureCollection([]);
-        }
-
-        try {
-            // Calculate bounding box
-            const bbox = turf.bbox(elevationSurface);
-
-            // Calculate optimal cell size based on area and target cell count
-            const width = bbox[2] - bbox[0];
-            const height = bbox[3] - bbox[1];
-            const area = width * height;
-            const cellSize = Math.sqrt(area / targetCells);
-
-            // Create grid with dynamic resolution
-            const grid = turf.pointGrid(bbox, cellSize, { units: 'degrees' });
-
-            // Interpolate elevation values from TIN to grid points
-            return {
-                type: 'FeatureCollection',
-                features: grid.features.map(point => {
-                    // Find the containing triangle in the TIN
-                    const elevation = this.interpolateElevation(point, elevationSurface);
-
-                    return {
-                        ...point,
-                        properties: {
-                            ...point.properties,
-                            elevation: elevation
-                        }
-                    };
-                })
-            };
-        } catch (error) {
-            logger.error(`Error in convertToGrid: ${error.message}`);
-            return turf.featureCollection([]);
-        }
+    static convertToGrid(elevationSurface) {
+        const bbox = turf.bbox(elevationSurface);
+        const cellSize = (bbox[2] - bbox[0]) / 5; // 5x5 grid
+        return turf.pointGrid(bbox, cellSize, {
+            properties: { elevation: 0 }
+        });
     }
 
     /**
-     * Interpolates elevation for a point from the TIN surface
-     * @param {Object} point - Point feature
-     * @param {Object} elevationSurface - TIN elevation surface
-     * @returns {number} - Interpolated elevation value
-     */
-    static interpolateElevation(point, elevationSurface) {
-        try {
-            // Get point coordinates
-            const [x, y] = point.geometry.coordinates;
-
-            // Find the triangle containing this point
-            for (const triangle of elevationSurface.features) {
-                if (turf.booleanPointInPolygon(point, triangle)) {
-                    // Extract triangle vertices and elevations
-                    const vertices = triangle.geometry.coordinates[0].slice(0, 3);
-                    const elevations = vertices.map((_, i) => {
-                        // Use properties.a, properties.b, properties.c for elevations
-                        const propKey = String.fromCharCode(97 + i); // 'a', 'b', 'c'
-                        return triangle.properties[propKey] || 0;
-                    });
-
-                    // Perform barycentric interpolation
-                    return this.barycentricInterpolation(x, y, vertices, elevations);
-                }
-            }
-
-            // If point is not in any triangle, use nearest neighbor
-            const nearest = turf.nearestPoint(point, turf.featureCollection(
-                elevationSurface.features.flatMap(f =>
-                    f.geometry.coordinates[0].slice(0, 3).map((coord, i) => ({
-                        type: 'Feature',
-                        geometry: { type: 'Point', coordinates: coord },
-                        properties: {
-                            elevation: f.properties[String.fromCharCode(97 + i)] || 0
-                        }
-                    }))
-                )
-            ));
-
-            return nearest.properties.elevation;
-        } catch (error) {
-            logger.warn(`Interpolation error: ${error.message}`);
-            return 0; // Default elevation if interpolation fails
-        }
-    }
-
-    /**
-     * Performs barycentric interpolation for a point within a triangle
-     * @param {number} x - X coordinate
-     * @param {number} y - Y coordinate
-     * @param {Array} vertices - Triangle vertices [[x1,y1], [x2,y2], [x3,y3]]
-     * @param {Array} values - Values at vertices [v1, v2, v3]
-     * @returns {number} - Interpolated value
-     */
-    static barycentricInterpolation(x, y, vertices, values) {
-        const [[x1, y1], [x2, y2], [x3, y3]] = vertices;
-
-        // Calculate barycentric coordinates
-        const denominator = ((y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3));
-        if (Math.abs(denominator) < 1e-10) {
-            // Degenerate triangle, return average
-            return values.reduce((sum, val) => sum + val, 0) / values.length;
-        }
-
-        const lambda1 = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / denominator;
-        const lambda2 = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / denominator;
-        const lambda3 = 1 - lambda1 - lambda2;
-
-        // Interpolate value
-        return lambda1 * values[0] + lambda2 * values[1] + lambda3 * values[2];
-    }
-
-    /**
-     * Calculate D8 flow accumulation
-     * @param {Object} grid - Regular grid
-     * @returns {Object} - Flow accumulation grid
+     * Calculates D8 flow accumulation for a grid
+     * 
+     * The D8 algorithm determines flow direction from each cell to its steepest downslope neighbor.
+     * Flow accumulation is then calculated by counting how many cells flow into each cell.
+     * 
+     * Steps:
+     * 1. Fill depressions to ensure continuous flow
+     * 2. Calculate flow direction for each cell
+     * 3. Accumulate flow by tracing paths downslope
+     * 
+     * @param {Object} grid - Regular grid FeatureCollection with elevation properties
+     * @returns {Object} - Grid with flow accumulation and direction properties
+     * @see https://pro.arcgis.com/en/pro-app/latest/tool-reference/spatial-analyst/how-flow-accumulation-works.htm
      */
     static d8FlowAccumulation(grid) {
-        // Use TypedArrays for better memory efficiency
-        const rows = Math.sqrt(grid.features.length);
-        const cells = new Float32Array(grid.features.map(f => f.properties.elevation));
-        const flowAccumulation = new Uint32Array(cells.length).fill(1);
-        const flowDirections = new Int32Array(cells.length).fill(-1);
-
-        // Chunk processing for depression filling
-        const chunkSize = 10;
-        const filledCells = this.fillDepressionsInChunks(cells, rows, chunkSize);
-
-        // Parallel processing for flow directions
-        const chunks = this.splitIntoChunks(filledCells, chunkSize);
-        chunks.forEach((chunk, startIndex) => {
-            for (let i = 0; i < chunk.length; i++) {
-                const absoluteIndex = startIndex * chunkSize + i;
-                const neighbors = this.getNeighbors(absoluteIndex, rows, filledCells);
-
-                // Use Set for faster lookups
-                const flatArea = new Set(this.identifyFlatArea(absoluteIndex, neighbors, filledCells));
-
-                if (flatArea.size > 0) {
-                    this.resolveFlatArea(Array.from(flatArea), flowDirections, rows, filledCells);
-                } else {
-                    flowDirections[absoluteIndex] = this.findSteepestDescent(absoluteIndex, neighbors);
-                }
-            }
-        });
-
-        console.log('Flow directions calculated.');
-
-        // Optimize flow accumulation calculation
-        const visited = new Uint8Array(cells.length);
-        for (let i = 0; i < filledCells.length; i++) {
-            if (visited[i]) continue;
-
-            let currentCell = i;
-            const path = [];
-
-            while (flowDirections[currentCell] !== -1 && !visited[currentCell]) {
-                visited[currentCell] = 1;
-                path.push(currentCell);
-                currentCell = flowDirections[currentCell];
-            }
-
-            // Batch update accumulation values
-            path.forEach(cell => {
-                flowAccumulation[currentCell]++;
-            });
+        // Early validation
+        if (!grid?.features?.length) {
+            throw new Error('Invalid grid input');
         }
 
-        console.log('Flow accumulation calculated.');
+        const featuresLength = grid.features.length;
+        const rows = Math.round(Math.sqrt(featuresLength));
 
+        // Use TypedArrays for better performance
+        const cells = new Float32Array(featuresLength);
+        const flowAccumulation = new Uint32Array(featuresLength).fill(1);
+        const flowDirections = new Int8Array(featuresLength).fill(-1);
+        const visited = new Uint8Array(featuresLength);
+
+        // Initialize cells
+        grid.features.forEach((f, i) => {
+            cells[i] = f.properties.elevation;
+        });
+
+        // Process in chunks for better memory management
+        const CHUNK_SIZE = 1000;
+        const chunkCount = Math.ceil(featuresLength / CHUNK_SIZE);
+
+        for (let chunk = 0; chunk < chunkCount; chunk++) {
+            const start = chunk * CHUNK_SIZE;
+            const end = Math.min(start + CHUNK_SIZE, featuresLength);
+
+            // Fill depressions in chunk
+            this.fillDepressionsChunk(cells, rows, start, end);
+
+            // Calculate flow directions in chunk
+            for (let i = start; i < end; i++) {
+                const neighbors = this.getNeighbors(i, rows, cells);
+                const flatArea = this.identifyFlatArea(i, neighbors, cells);
+
+                if (flatArea.length > 0) {
+                    this.resolveFlatArea(flatArea, flowDirections, rows, cells);
+                } else {
+                    flowDirections[i] = this.findSteepestDescent(i, neighbors);
+                }
+            }
+        }
+
+        // Calculate flow accumulation
+        for (let i = 0; i < featuresLength; i++) {
+            if (visited[i]) continue;
+
+            let current = i;
+            const path = [];
+
+            while (flowDirections[current] !== -1 && !visited[current]) {
+                visited[current] = 1;
+                path.push(current);
+                current = flowDirections[current];
+            }
+
+            // Propagate flow downstream
+            for (let j = 0; j < path.length - 1; j++) {
+                flowAccumulation[path[j + 1]] += flowAccumulation[path[j]];
+            }
+        }
+
+        // Convert back to feature collection
         return {
             type: "FeatureCollection",
             features: grid.features.map((cell, index) => ({
@@ -1154,6 +1540,23 @@ class AgriculturalLandAnalyzer {
                 }
             }))
         };
+    }
+
+    // Optimized helper methods
+    static fillDepressionsChunk(cells, rows, start, end) {
+        let changed;
+        do {
+            changed = false;
+            for (let i = start; i < end; i++) {
+                const neighbors = this.getNeighbors(i, rows, cells);
+                const lowestNeighbor = Math.min(...neighbors.map(n => n.elevation));
+
+                if (cells[i] < lowestNeighbor) {
+                    cells[i] = lowestNeighbor;
+                    changed = true;
+                }
+            }
+        } while (changed);
     }
 
     // Helper method for chunked processing
