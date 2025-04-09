@@ -141,7 +141,7 @@ class BoreholeSiteService {
 
         // Batch Earth Engine API calls for efficiency
         const elevation = ee.Image('USGS/SRTMGL1_003');
-        const landcover = ee.ImageCollection('MODIS/006/MCD12Q1').first();
+        // const landcover = ee.ImageCollection('MODIS/006/MCD12Q1').first();
         const soilMoisture = ee.ImageCollection('NASA_USDA/HSL/SMAP_soil_moisture').first();
         const temperature = ee.ImageCollection('MODIS/006/MOD11A1').first();
 
@@ -1466,12 +1466,14 @@ class BoreholeSiteService {
                 lithologicalData
             };
 
+            console.log('FIELD_ELEVATION:', AgriculturalLandAnalyzer.FIELD_ELEVATION.MEAN);
+
             // Calculate individual scores for each factor
             const scores = {
                 aquiferPresence: this.calculateAquiferScore(combinedData.geologicalFormations),
                 rockHardness: this.calculateRockHardnessScore(combinedData.lithologicalData),
                 fractureZones: this.calculateFractureZoneScore(combinedData.geologicalFeatures),
-                elevationProfile: this.calculateElevationScore(combinedData.elevationData),
+                elevationProfile: AgriculturalLandAnalyzer.FIELD_ELEVATION.MEAN, //this.calculateElevationScore(combinedData.elevationData),
                 slope: this.calculateSlopeScore(combinedData.elevationData)
             };
 
@@ -1820,11 +1822,11 @@ class BoreholeSiteService {
      * Calculate the slope score.
      */
     static calculateSlopeScore(elevationData) {
-        const slopes = elevationData.map(point => point.slope || 0);
-        const averageSlope = slopes.reduce((sum, slope) => sum + slope, 0) / slopes.length;
-
+        //const slopes = elevationData.map(point => point.slope || 0);
+        //const averageSlope = slopes.reduce((sum, slope) => sum + slope, 0) / slopes.length;
+        
         // Lower slope is better for groundwater retention (normalized to 0-1 range)
-        return Math.max(0, 1 - (averageSlope / 45)); // Assume 45 degrees is the upper limit
+        return Math.max(0, 1 - (this.FIELD_SLOPE / 45)); // Assume 45 degrees is the upper limit
     }
 
     /**

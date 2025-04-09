@@ -80,7 +80,7 @@ class StatisticsUtils {
      * @returns {Object} - Object containing lower and upper bounds
      */
     static confidenceInterval(values, confidence = 0.95) {
-        console.log('Calculating confidence interval...', values);
+        console.log('Calculating confidence interval...');
         if (values.length < 2) {
             throw new Error('Need at least 2 values for confidence interval');
         }
@@ -184,7 +184,6 @@ class AgriculturalLandAnalyzer {
             const elevations = elevationData
                 .filter(item => item.status === "fulfilled")
                 .flatMap(item => item.value.elevation);
-            console.log('Elevations:', elevations);
 
             const { mean, median, min, max } = StatisticsUtils;
 
@@ -508,7 +507,6 @@ class AgriculturalLandAnalyzer {
                 slopes.push(slope);
             }
         });
-        console.log('Slope stats:', slopes);
         const slopeConfidence = StatisticsUtils.confidenceInterval(slopes);
         return {
             mean: StatisticsUtils.mean(slopes),

@@ -4,68 +4,107 @@ const dotenv = require('dotenv');
 const Ajv = require('ajv');
 const { LRUCache } = require('lru-cache');
 const { orsSchema, overpassSchema } = require('../schemas/overpass.schema.js');
-const { default: def } = require('ajv/dist/vocabularies/applicator/additionalItems.js');
+//const { default: def } = require('ajv/dist/vocabularies/applicator/additionalItems.js');
 
 dotenv.config();
 
+const ROAD_RANKING = {
+    motorway: 1,
+    trunk: 0.9,
+    primary: 0.8,
+    secondary: 0.7,
+    tertiary: 0.6,
+    residential: 0.5,
+    unclassified: 0.4,
+    track: 0.3,
+    path: 0.2,
+    service: 0.4,
+    default: 0.5
+};
+
+const ROAD_WEIGHTS = {
+    surface_paved: 1.0,
+    surface_asphalt: 1.0,
+    surface_concrete: 0.9,
+    surface_gravel: 0.6,
+    surface_unpaved: 0.4,
+    surface_dirt: 0.3,
+    surface_grass: 0.2,
+    width_wide: 1.0,
+    width_medium: 0.7,
+    width_narrow: 0.4,
+    width_very_narrow: 0.2,
+    default: 0.5
+};
+
 class FarmRouteAnalyzer {
     constructor() {
+
+        this.ajv = new Ajv({ strict: false });
+        this.orsValidator = this.ajv.compile(orsSchema);
+        this.overpassValidator = this.ajv.compile(overpassSchema);
+
         this.orsConfig = {
             url: process.env.ORS_URL || 'https://api.openrouteservice.org/v2/directions/driving-car/geojson',
             apiKey: process.env.ORS_API_KEY,
             timeout: parseInt(process.env.ORS_TIMEOUT) || 10000
         };
 
-        this.overpassConfig = {
-            url: process.env.OVERPASS_URL || 'https://overpass-api.de/api/interpreter',
-            timeout: parseInt(process.env.OVERPASS_TIMEOUT) || 15000,
-            cacheMax: parseInt(process.env.OVERPASS_CACHE_MAX) || 100
-        };
-
-        this.roadMetrics = this.initRoadMetrics();
-        this.validator = new Ajv();
-        this.overpassCache = new LRUCache({ max: this.overpassConfig.cacheMax });
         this.requestQueue = [];
         this.rateLimit = parseInt(process.env.RATE_LIMIT) || 5; // Requests per second
         this.lastRequest = 0;
         this.RATE_LIMIT_INTERVAL = 5000; // 5 seconds between requests
-        this.routeCache = new LRUCache({ max: 50 }); // Cache for routes
-    }
 
-    initRoadMetrics() {
-        return {
-            ranking: {
-                motorway: 1,
-                trunk: 0.9,
-                primary: 0.8,
-                secondary: 0.7,
-                tertiary: 0.6,
-                residential: 0.5,
-                unclassified: 0.4,
-                track: 0.3,
-                path: 0.2,
-                service: 0.4,
-                default: 0.5
+        // Change this from a property to a method
+        this.rateLimitConfig = {
+            default: { requests: parseInt(process.env.RATE_LIMIT) || 5, interval: 1000 },
+            hazard: { requests: 1, interval: 5000 }
+        };
+        this.requestTimestamps = new Map();
+
+        this.routeCache = new LRUCache({
+            max: 50,
+            ttl: 1000 * 60 * 60, // 1 hour expiration
+            updateAgeOnGet: true // Refresh TTL on cache hits
+        }); // Cache for routes
+
+
+
+        // refactored
+        // Unified rate limiting configuration
+        this.rateLimits = {
+            default: {
+                requests: parseInt(process.env.RATE_LIMIT) || 5,
+                interval: 1000
             },
-            weights: {
-                surface_paved: 1.0,
-                surface_asphalt: 1.0,
-                surface_concrete: 0.9,
-                surface_gravel: 0.6,
-                surface_unpaved: 0.4,
-                surface_dirt: 0.3,
-                surface_grass: 0.2,
-                width_wide: 1.0,
-                width_medium: 0.7,
-                width_narrow: 0.4,
-                width_very_narrow: 0.2,
-                default: 0.5
-            }, hazardWeights: {
+            hazard: {
+                requests: 1,
+                interval: 5000
+            }
+        };
+        this.requestQueues = new Map();
+
+        // Optimized spatial query configuration
+        this.overpassConfig = {
+            url: process.env.OVERPASS_URL || 'https://overpass-api.de/api/interpreter',
+            timeout: parseInt(process.env.OVERPASS_TIMEOUT) || 15000,
+            bufferSize: parseFloat(process.env.OVERPASS_BUFFER) || 0.02, // km
+            cacheMax: parseInt(process.env.OVERPASS_CACHE_MAX) || 100
+        };
+
+        // Static road metrics
+        this.roadMetrics = {
+            ranking: ROAD_RANKING,
+            weights: ROAD_WEIGHTS,
+            hazardWeights: {
                 bridge: parseFloat(process.env.HAZARD_WEIGHT_BRIDGE) || 0.2,
                 water: parseFloat(process.env.HAZARD_WEIGHT_WATER) || 0.1,
                 landslide: parseFloat(process.env.HAZARD_WEIGHT_LANDSLIDE) || 0.3
             }
         };
+
+        // Cache initialization
+        this.overpassCache = new LRUCache({ max: this.overpassConfig.cacheMax });
     }
 
     /**
@@ -76,40 +115,49 @@ class FarmRouteAnalyzer {
      * @throws {Error} Throws an error if the accessibility analysis fails.
      */
     async analyzeFieldAccessibility(coordinates) {
-        console.log(`Analyzing field accessibility for coordinates: ${JSON.stringify(coordinates)}`);
-
         try {
-            // Get basic distance metrics and route information
+            // Validate input
+            this.validateCoordinates(coordinates);
+
+            // Get accessibility metrics (improved function name for clarity)
             console.log("Calculating accessibility metrics...");
             const accessibilityMetrics = await this.calculateAccessibilityMetrics(coordinates);
 
-            // Calculate hazards using the new route-based approach
+            // Calculate hazards along critical routes
             console.log("Calculating hazards along critical routes...");
             const hazards = await this.calculateHazardsForRoads(coordinates, accessibilityMetrics);
 
-            const result = {
-                metrics: accessibilityMetrics,
-                hazards: hazards,
-                overall_accessibility_score: this.calculateOverallAccessibilityScore(accessibilityMetrics, hazards)
-            };
-
-            // Add a summary of the critical segment for quick reference
-            if (hazards.critical_segment) {
-                result.critical_segment_summary = {
-                    distance_to_primary_road: accessibilityMetrics.distance_to_primary,
-                    hazards_count: hazards.critical_segment.bridges +
-                        hazards.critical_segment.water_crossings +
-                        hazards.critical_segment.landslides,
-                    risk_level: this.getRiskLevel(hazards.critical_segment.risk_score)
-                };
-            }
-
-            console.log("Field accessibility analysis completed successfully.");
-            return result;
+            // Create and return the final result
+            return this.formatAccessibilityResult(
+                accessibilityMetrics,
+                hazards,
+                this.calculateOverallAccessibilityScore(accessibilityMetrics, hazards)
+            );
         } catch (error) {
-            console.error("Field accessibility analysis failed:", error);
-            throw error;
+            throw this.handleApiError(error, 'Field accessibility analysis');
         }
+    }
+
+    // Helper method to format results consistently
+    formatAccessibilityResult(metrics, hazards, overallScore) {
+        const result = {
+            metrics,
+            hazards,
+            overall_accessibility_score: overallScore
+        };
+
+        // Add critical segment summary if available
+        if (hazards.critical_segment) {
+            result.critical_segment_summary = {
+                distance_to_primary_road: metrics.distance_to_primary,
+                hazards_count: hazards.critical_segment.bridges +
+                    hazards.critical_segment.water_crossings +
+                    hazards.critical_segment.landslides,
+                risk_level: this.getRiskLevel(hazards.critical_segment.risk_score)
+            };
+        }
+
+        return result;
     }
 
     /**
@@ -144,127 +192,135 @@ class FarmRouteAnalyzer {
         return route;
     }
 
-    async fetchWithRetry(fetchFn, cacheKey, maxRetries = 3, delay = 1000) {
-        if (this.overpassCache.has(cacheKey)) {
-            return this.overpassCache.get(cacheKey)
+    // Add this new method
+    async applyRateLimit(type = 'default') {
+        const config = this.rateLimits[type] || this.rateLimits.default;
+
+        if (!this.requestQueues.has(type)) {
+            this.requestQueues.set(type, []);
+        }
+
+        const now = Date.now();
+        const queue = this.requestQueues.get(type).filter(t => t > now - config.interval);
+
+        if (queue.length >= config.requests) {
+            const waitTime = config.interval - (now - queue[0]);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+
+        this.requestQueues.set(type, [...queue, Date.now()]);
+    }
+
+    async fetchWithRetry(fetchFn, options = {}) {
+        const {
+            maxRetries = 3,
+            baseDelay = 1000,
+            useCache = true,
+            cacheKey = null,
+            cacheStore = this.overpassCache
+        } = options;
+
+        // Check cache first if enabled
+        if (useCache && cacheKey && cacheStore.has(cacheKey)) {
+            return cacheStore.get(cacheKey);
         }
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                const result = await fetchFn()
-                this.overpassCache.set(cacheKey, result)
-                return result
+                const result = await fetchFn();
+
+                // Cache successful result
+                if (useCache && cacheKey) {
+                    cacheStore.set(cacheKey, result);
+                }
+
+                return result;
             } catch (error) {
-                if (attempt === maxRetries) {
-                    throw error
+                const isRetryable = error.response?.status === 429 ||
+                    error.code === 'ECONNRESET' ||
+                    error.code === 'ECONNABORTED';
+
+                if (attempt === maxRetries || !isRetryable) {
+                    throw error;
                 }
 
-                if (error.response?.status === 429 || error.code === 'ECONNRESET') {
-                    await new Promise(resolve => setTimeout(resolve, delay * attempt))
-                    continue
-                }
+                // Calculate delay with exponential backoff and jitter
+                const retryAfter = error.response?.headers?.['retry-after'];
+                const delay = retryAfter
+                    ? parseInt(retryAfter) * 1000
+                    : Math.pow(2, attempt) * baseDelay + (Math.random() * baseDelay);
 
-                throw error
+                console.warn(`Retry ${attempt}/${maxRetries} in ${delay}ms`);
+                await new Promise(resolve => setTimeout(resolve, delay));
             }
         }
     }
 
     async buildOverpassQuery(geometry) {
-        const buffered = turf.buffer(geometry, 0.02, { units: 'kilometers' });
+        const buffered = turf.buffer(
+            geometry,
+            this.overpassConfig.bufferSize,
+            { units: 'kilometers' }
+        );
         const bbox = turf.bbox(buffered);
 
-        return `
-            [out:json][timeout:25];
-            (
-                way[bridge=yes](${bbox[1]},${bbox[0]},${bbox[3]},${bbox[2]});
-                way["waterway"~"river|stream"](${bbox[1]},${bbox[0]},${bbox[3]},${bbox[2]});
-                way["natural"~"water|landslide"](${bbox[1]},${bbox[0]},${bbox[3]},${bbox[2]});
-            );
-            out body;
-        `.trim(); // Removes leading/trailing whitespace but keeps formatting
+        return `[out:json][timeout:25];(
+          way[bridge=yes](${bbox[1]},${bbox[0]},${bbox[3]},${bbox[2]});
+          way["waterway"~"river|stream"](${bbox[1]},${bbox[0]},${bbox[3]},${bbox[2]});
+          way["natural"~"water|landslide"](${bbox[1]},${bbox[0]},${bbox[3]},${bbox[2]});
+        );
+        out body;`.trim();
+    }
+
+    // Combined spatial query for roads and population centers
+    async querySpatialData(coordinates) {
+        const query = `
+        [out:json][timeout:60];
+        (
+            way["highway"~"primary|secondary|tertiary"](around:50000,${coordinates.lat},${coordinates.lon});
+            node["place"~"city|town"](around:200000,${coordinates.lat},${coordinates.lon});
+        );
+        out body;
+        `;
+
+        return this.fetchWithRetry(
+            () => this.queryOverpass(query),
+            { cacheKey: `spatial_${coordinates.lat}_${coordinates.lon}` }
+        );
     }
 
     async queryHazards(geometry) {
         const cacheKey = `hazards_${this.hashGeometry(geometry)}`;
-        const cached = this.overpassCache.get(cacheKey);
-        if (cached) return cached;
 
-        const MAX_RETRIES = 3;
-        let retryCount = 0;
-        let response;
+        return this.fetchWithRetry(
+            async () => {
+                await this.applyRateLimit('hazard'); // Changed from this.rateLimit
 
-        while (retryCount <= MAX_RETRIES) {
-            let timeoutId;
-            const controller = new AbortController();
-            timeoutId = setTimeout(() => controller.abort(), this.overpassConfig.timeout);
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), this.overpassConfig.timeout);
 
-            try {
-                await this.rateLimitCheckHazardQuery(); // Client-side rate limiting
+                try {
+                    const query = await this.buildOverpassQuery(geometry);
+                    const response = await axios.post(
+                        this.overpassConfig.url,
+                        `data=${encodeURIComponent(query)}`,
+                        {
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            signal: controller.signal
+                        }
+                    );
 
-                const query = await this.buildOverpassQuery(geometry);
-                response = await axios.post(
-                    this.overpassConfig.url,
-                    `data=${encodeURIComponent(query)}`,
-                    {
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        signal: controller.signal
+                    if (!this.validateApiResponse(response.data, 'overpass')) {
+                        throw new Error('Invalid hazard data format');
                     }
-                );
 
-                clearTimeout(timeoutId);
-
-                // Handle HTTP 429 from server
-                if (response.status === 429) {
-                    throw new axios.AxiosError('Rate limit exceeded', null, null, null, response);
+                    return this.processHazardElements(response.data);
+                } finally {
+                    clearTimeout(timeoutId);
                 }
-
-                // Validate response structure
-                if (!this.validateApiResponse(response.data, 'overpass')) {
-                    throw new Error('Invalid hazard data format');
-                }
-
-                // Exit loop on success
-                break;
-            } catch (error) {
-                clearTimeout(timeoutId);
-
-                // Determine if retry is needed
-                const isRateLimit = error.response?.status === 429;
-                const isTimeout = error.code === 'ECONNABORTED' || error.name === 'AbortError';
-
-                if (retryCount >= MAX_RETRIES) {
-                    throw new Error(`Request failed after ${MAX_RETRIES} retries: ${error.message}`);
-                }
-
-                if (isRateLimit || isTimeout) {
-                    // Calculate delay with exponential backoff and jitter
-                    const retryAfterHeader = error.response?.headers?.['retry-after'];
-                    const baseDelay = retryAfterHeader
-                        ? parseInt(retryAfterHeader) * 1000
-                        : Math.pow(2, retryCount) * 1000;
-
-                    const jitter = Math.random() * 1000;
-                    const delay = baseDelay + jitter;
-
-                    console.warn(`Retry ${retryCount + 1}/${MAX_RETRIES} in ${delay}ms`);
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                    retryCount++;
-                } else {
-                    // Non-retryable error
-                    throw error;
-                }
-            }
-        }
-
-        // Process and cache successful response
-        const result = {
-            bridges: this.processBridgeElements(response.data),
-            water: this.processWaterElements(response.data),
-            landslides: this.processLandslideElements(response.data)
-        };
-
-        this.overpassCache.set(cacheKey, result);
-        return result;
+            },
+            { cacheKey }
+        );
     }
 
     calculateCompositeRisk(hazards) {
@@ -276,9 +332,37 @@ class FarmRouteAnalyzer {
     }
 
     validateApiResponse(response, type = 'ors') {
-        const ajv = new Ajv({ strict: false });
-        const schema = type === 'ors' ? orsSchema : overpassSchema;
-        return ajv.validate(schema, response);
+        return type === 'ors' ? this.orsValidator(response) : this.overpassValidator(response);
+    }
+
+    // Replace separate rate limiting methods with a unified approach
+    async rateLimit(type = 'default') {
+        const limits = {
+            'default': { requests: this.rateLimit, period: 1000 },
+            'hazard': { requests: 1, period: this.RATE_LIMIT_INTERVAL }
+        };
+
+        const config = limits[type] || limits['default'];
+        const now = Date.now();
+
+        if (!this.requestQueues) this.requestQueues = {};
+        if (!this.requestQueues[type]) this.requestQueues[type] = [];
+
+        // Clean up old timestamps
+        this.requestQueues[type] = this.requestQueues[type]
+            .filter(t => t > now - config.period);
+
+        // Wait if we've reached the limit
+        if (this.requestQueues[type].length >= config.requests) {
+            const oldestRequest = this.requestQueues[type][0];
+            const waitTime = config.period - (now - oldestRequest);
+            if (waitTime > 0) {
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+            }
+        }
+
+        // Record this request
+        this.requestQueues[type].push(Date.now());
     }
 
     async rateLimitCheck() {
@@ -294,67 +378,43 @@ class FarmRouteAnalyzer {
         this.requestQueue.push(Date.now());
     }
 
-    async rateLimitCheckHazardQuery() {
-        const now = Date.now();
-        const elapsed = now - this.lastRequest;
-        if (elapsed < this.RATE_LIMIT_INTERVAL) {
-            await new Promise(resolve =>
-                setTimeout(resolve, this.RATE_LIMIT_INTERVAL - elapsed)
-            );
-        }
-        this.lastRequest = Date.now();
-    }
-
     hashGeometry(geometry) {
-        return turf.centroid(geometry).geometry.coordinates
-            .map(c => c.toFixed(6)).join('-');
+        const center = turf.centroid(geometry).geometry.coordinates;
+        // More efficient string creation with precise decimal precision
+        return `${center[0].toFixed(4)},${center[1].toFixed(4)}`;
     }
 
-    validateCoordinates(start, end) {
-        const validate = (coord, name) => {
-            if (!coord || typeof coord.lat !== 'number' || typeof coord.lon !== 'number') {
-                throw new Error(`Invalid ${name} coordinates`);
-            }
-            if (isNaN(coord.lat) || isNaN(coord.lon)) {
-                throw new Error(`Invalid ${name} coordinates: Lat/Lon must be numbers`);
-            }
-        };
+    validateCoordinates(coord, name = 'coordinates') {
+        if (!coord) {
+            throw new Error(`Missing ${name}`);
+        }
 
-        validate(start, 'start');
-        validate(end, 'end');
+        if (typeof coord.lat !== 'number' || typeof coord.lon !== 'number') {
+            throw new Error(`Invalid ${name}: lat and lon must be numbers`);
+        }
+
+        if (isNaN(coord.lat) || isNaN(coord.lon)) {
+            throw new Error(`Invalid ${name}: lat and lon cannot be NaN`);
+        }
+
+        // Add range validation for extra safety
+        if (coord.lat < -90 || coord.lat > 90) {
+            throw new Error(`Invalid ${name}: latitude must be between -90 and 90`);
+        }
+
+        if (coord.lon < -180 || coord.lon > 180) {
+            throw new Error(`Invalid ${name}: longitude must be between -180 and 180`);
+        }
     }
 
-    validateCoordinatesRefactored(start) {
-        const validate = (coord, name) => {
-            if (!coord || typeof coord.lat !== 'number' || typeof coord.lon !== 'number') {
-                throw new Error(`Invalid ${name} coordinates`);
-            }
-            if (isNaN(coord.lat) || isNaN(coord.lon)) {
-                throw new Error(`Invalid ${name} coordinates: Lat/Lon must be numbers`);
-            }
-        };
-
-        validate(start, 'start');
-    }
-
-    processBridgeElements(data) {
-        return data.elements?.filter(el =>
-            el.tags?.bridge === 'yes' &&
-            el.geometry?.length > 1
-        ) || [];
-    }
-
-    processWaterElements(data) {
-        return data.elements?.filter(el =>
-            el.tags?.waterway ||
-            el.tags?.natural === 'water'
-        ) || [];
-    }
-
-    processLandslideElements(data) {
-        return data.elements?.filter(el => el.tags?.natural === 'landslide') || [];
-    }
-
+    /**
+     * Optimized Haversine distance calculation
+     * @param {number} lat1 - Start latitude
+     * @param {number} lon1 - Start longitude
+     * @param {number} lat2 - End latitude
+     * @param {number} lon2 - End longitude
+     * @returns {number} Distance in meters
+     */
     haversineDistance(lat1, lon1, lat2, lon2) {
         const R = 6371e3;
         const φ1 = lat1 * Math.PI / 180;
@@ -368,13 +428,9 @@ class FarmRouteAnalyzer {
         return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     }
 
-    enhanceError(error, context) {
-        return Object.assign(new Error(`${context}: ${error.message}`), { original: error });
-    }
-
     handleError(error, context) {
         console.error(`${context}:`, error);
-        throw this.enhanceError(error, context);
+        throw this.handleApiError(error, context);
     }
 
     createSimpleLineString(coordinates, roadType, metrics) {
@@ -441,53 +497,64 @@ class FarmRouteAnalyzer {
     }
 
     calculateNearestDistance(coordinates, elements) {
-        if (!elements || elements.length === 0) {
-            console.log("No elements found for distance calculation");
-            return -1;
-        }
+        let minDistance = Infinity;
+
+        elements.forEach(element => {
+            if (element.geometry) {
+                const line = turf.lineString(
+                    element.geometry.map(p => [p.lon, p.lat])
+                );
+                const nearest = turf.nearestPointOnLine(
+                    line,
+                    turf.point([coordinates.lon, coordinates.lat])
+                );
+
+                if (nearest.properties.dist < minDistance) {
+                    minDistance = nearest.properties.dist;
+                }
+            }
+        });
+
+        return minDistance !== Infinity ? minDistance : -1;
+    }
+
+    /**
+   * Calculates distance to nearest populated place from spatial data
+   * @param {Object} coordinates - Reference coordinates {lat, lon}
+   * @param {Array} places - Array of OSM node elements with place tags
+   * @returns {number} Distance in meters or -1 if no places found
+   */
+    findNearestPlaceDistance(coordinates, places) {
+        if (!places || places.length === 0) return -1;
 
         let minDistance = Infinity;
 
-        for (const element of elements) {
-            // Handle different element types (nodes vs ways)
-            if (element.type === "node") {
-                const distance = this.haversineDistance(
-                    coordinates.lat, coordinates.lon,
-                    element.lat, element.lon
-                );
-
-                if (distance < minDistance) {
-                    minDistance = distance;
-                }
+        for (const place of places) {
+            // Validate place structure
+            if (!place.lat || !place.lon) {
+                console.warn('Invalid place element missing coordinates:', place);
+                continue;
             }
-            // For ways, check each point in the geometry
-            else if (element.geometry) {
-                for (const point of element.geometry) {
-                    const distance = this.haversineDistance(
-                        coordinates.lat, coordinates.lon,
-                        point.lat, point.lon
-                    );
 
-                    if (distance < minDistance) {
-                        minDistance = distance;
-                    }
-                }
+            const distance = this.haversineDistance(
+                coordinates.lat,
+                coordinates.lon,
+                parseFloat(place.lat),
+                parseFloat(place.lon)
+            );
+
+            if (distance < minDistance) {
+                minDistance = distance;
             }
         }
 
-        if (minDistance === Infinity) {
-            console.log("Could not calculate minimum distance");
-            return -1;
-        }
-
-        console.log(`Calculated minimum distance: ${minDistance}`);
-        return minDistance;
+        return minDistance !== Infinity ? Math.round(minDistance) : -1;
     }
 
     async calculatePopulationDistances(coordinates) {
         // First, determine the country based on coordinates
         try {
-            const country = await this.determineCountry(coordinates);
+            // const country = await this.determineCountry(coordinates);
 
             // More flexible query for cities and towns
             const query = `
@@ -606,7 +673,7 @@ class FarmRouteAnalyzer {
     }
 
     async queryOverpass(query) {
-        await this.rateLimitCheck();
+        await this.applyRateLimit('default');
 
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), this.overpassConfig.timeout);
@@ -625,7 +692,7 @@ class FarmRouteAnalyzer {
             return response.data;
         } catch (error) {
             clearTimeout(timeoutId);
-            throw this.enhanceError(error, 'Overpass query failed');
+            throw this.handleApiError(error, 'Overpass query failed');
         }
     }
 
@@ -638,40 +705,79 @@ class FarmRouteAnalyzer {
      * @returns {Promise<Object>} Accessibility metrics including road distances, population distances, and optional route information
      * @throws {Error} If accessibility metrics calculation fails
      */
+
     async calculateAccessibilityMetrics(coordinates) {
         try {
-            // Validate input coordinates
-            this.validateCoordinatesRefactored(coordinates);
+            // Single combined API call
+            const spatialData = await this.querySpatialData(coordinates);
 
-            // Calculate distances to different road types
-            const roadDistances = await this.calculateRoadDistances(coordinates);
+            // Process both datasets from single response
+            const roadMetrics = this.processRoadData(spatialData, coordinates);
+            const populationMetrics = this.processPopulationData(spatialData, coordinates);
 
-            // Calculate distances to population centers
-            const populationDistances = await this.calculatePopulationDistances(coordinates);
-
-            // Add route information for the critical segment (field to primary road)
-            const primaryRoadInfo = await this.findNearestPrimaryRoadPoint(coordinates);
-
-            // Only add route data if we found a primary road
-            let routeData = {};
-            if (primaryRoadInfo.point) {
-                const route = await this.calculateRealRouteWithCache(coordinates, primaryRoadInfo.point);
-                routeData = {
-                    primary_road_route: {
-                        distance: primaryRoadInfo.distance,
-                        route_geometry: route.features[0].geometry
-                    }
-                };
-            }
+            // Uses cached data for primary road lookup
+            const primaryRoadInfo = this.findNearestPrimaryFromSpatialData(spatialData, coordinates);
 
             return {
-                ...roadDistances,
-                ...populationDistances,
-                ...routeData
+                ...roadMetrics,
+                ...populationMetrics,
+                primary_road_route: {
+                    distance: primaryRoadInfo,
+                    type: 'primary'
+                }
             };
         } catch (error) {
-            this.handleError(error, 'Accessibility metrics calculation failed');
+            this.handleError(error, 'Accessibility metrics calculation');
         }
+    }
+
+    // New processing methods for combined data
+    processRoadData(spatialData, coordinates) {
+        const roads = {
+            primary: spatialData.elements.filter(el =>
+                el.type === 'way' && el.tags?.highway === 'primary'
+            ),
+            secondary: spatialData.elements.filter(el =>
+                el.type === 'way' && el.tags?.highway === 'secondary'
+            ),
+            tertiary: spatialData.elements.filter(el =>
+                el.type === 'way' && el.tags?.highway === 'tertiary'
+            )
+        };
+
+        return {
+            distance_to_primary: this.calculateNearestDistance(coordinates, roads.primary),
+            distance_to_secondary: this.calculateNearestDistance(coordinates, roads.secondary),
+            distance_to_tertiary: this.calculateNearestDistance(coordinates, roads.tertiary)
+        };
+    }
+
+    processPopulationData(spatialData, coordinates) {
+        const places = {
+            cities: spatialData.elements.filter(el =>
+                el.type === 'node' && el.tags?.place === 'city'
+            ),
+            towns: spatialData.elements.filter(el =>
+                el.type === 'node' && el.tags?.place === 'town'
+            )
+        };
+
+        return {
+            distance_to_city: this.findNearestPlaceDistance(coordinates, places.cities),
+            distance_to_town: this.findNearestPlaceDistance(coordinates, places.towns)
+        };
+    }
+
+    // Updated primary road finding using cached data
+    findNearestPrimaryFromSpatialData(spatialData, coordinates) {
+        const primaryRoads = spatialData.elements.filter(el =>
+            el.type === 'way' && el.tags?.highway === 'primary'
+        );
+
+        if (!primaryRoads.length) throw new Error('No primary roads found');
+
+        // Uses optimized Turf.js calculation
+        return this.calculateNearestDistance(coordinates, primaryRoads);
     }
 
     /**
@@ -684,7 +790,7 @@ class FarmRouteAnalyzer {
      */
     async calculateRealRoute(startCoord, endCoord) {
         try {
-            await this.rateLimitCheck();
+            await this.applyRateLimit('default');
 
             const response = await axios.post(
                 this.orsConfig.url,
@@ -711,7 +817,7 @@ class FarmRouteAnalyzer {
 
             return response.data;
         } catch (error) {
-            throw this.enhanceError(error, 'Route calculation failed');
+            throw this.handleApiError(error, 'Route calculation failed');
         }
     }
 
@@ -976,7 +1082,7 @@ class FarmRouteAnalyzer {
      * @param {Object} coordinates - The reference coordinates with lat and lon properties
      * @param {string} roadType - The type of road to search for (e.g., 'secondary', 'tertiary')
      * @returns {Object|null} The nearest road point with lat and lon, or null if no roads found
-     */
+    */
     async findNearestRoadPoint(coordinates, roadType) {
         const query = `
             [out:json][timeout:60];
@@ -1018,7 +1124,7 @@ class FarmRouteAnalyzer {
      * @param {Object} metrics - Distance metrics to different road types
      * @param {Object} hazards - Hazard information for critical road segments
      * @returns {number} A normalized accessibility score between 0 and 1
-     */
+    */
     calculateOverallAccessibilityScore(metrics, hazards) {
         // Base score on distances
         let score = 0;
@@ -1048,6 +1154,81 @@ class FarmRouteAnalyzer {
         }
 
         return score;
+    }
+
+    /**
+     * Processes hazard elements from geographic data, categorizing them into bridges, water features, and landslides.
+     * 
+     * @param {Object} data - The input data containing geographic elements
+     * @returns {Object} A categorized result with arrays of bridges, water features, and landslides
+    */
+    processHazardElements(data) {
+        const result = {
+            bridges: [],
+            water: [],
+            landslides: []
+        };
+
+        if (!data.elements || !Array.isArray(data.elements)) {
+            return result;
+        }
+
+        // Process all elements in a single iteration
+        data.elements.forEach(el => {
+            if (el.tags) {
+                // Check for bridges
+                if (el.tags.bridge === 'yes' && el.geometry?.length > 1) {
+                    result.bridges.push(el);
+                }
+
+                // Check for water elements
+                if (el.tags.waterway || el.tags.natural === 'water') {
+                    result.water.push(el);
+                }
+
+                // Check for landslides
+                if (el.tags.natural === 'landslide') {
+                    result.landslides.push(el);
+                }
+            }
+        });
+
+        return result;
+    }
+
+    /**
+     * Handles and enhances API errors with additional context and retry information.
+     * 
+     * @param {Error} error - The original error object
+     * @param {string} context - Contextual information about where the error occurred
+     * @returns {Error} An enhanced error object with additional metadata and retry guidance
+    */
+    handleApiError(error, context) {
+        // Create a structured error object
+        const enhancedError = {
+            message: `${context}: ${error.message}`,
+            original: error,
+            timestamp: new Date().toISOString(),
+            context,
+            isRetryable: false
+        };
+
+        // Determine if the error is retryable
+        if (error.response) {
+            enhancedError.status = error.response.status;
+            enhancedError.isRetryable = [429, 500, 502, 503, 504].includes(error.response.status);
+        } else if (error.code) {
+            enhancedError.code = error.code;
+            enhancedError.isRetryable = ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT'].includes(error.code);
+        }
+
+        // Log with appropriate details
+        console.error(JSON.stringify(enhancedError));
+
+        // Return a proper Error object with enhanced properties
+        const resultError = new Error(enhancedError.message);
+        Object.assign(resultError, enhancedError);
+        return resultError;
     }
 }
 
