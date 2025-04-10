@@ -271,7 +271,6 @@ class FarmRouteAnalyzer {
         const bridgeRisk = Math.min(hazards.bridges.length * this.roadMetrics.hazardWeights.bridge, 1);
         const waterRisk = Math.min(hazards.water.length * this.roadMetrics.hazardWeights.water, 1);
         const landslideRisk = Math.min(hazards.landslides.length * this.roadMetrics.hazardWeights.landslide, 1);
-
         return (bridgeRisk + waterRisk + landslideRisk) / 3;
     }
 
@@ -485,62 +484,128 @@ class FarmRouteAnalyzer {
     }
 
     async calculatePopulationDistances(coordinates) {
-        // First, determine the country based on coordinates
         try {
-            const country = await this.determineCountry(coordinates);
+            // Cache key for the entire operation
+            const cacheKey = `population_${coordinates.lat}_${coordinates.lon}`;
+            const cachedResult = this.overpassCache.get(cacheKey);
+            if (cachedResult) return cachedResult;
 
-            // More flexible query for cities and towns
-            const query = `
-                [out:json][timeout:60];
-                (
-                    // Look for capital cities
-                    node["place"="city"](around:200000,${coordinates.lat},${coordinates.lon});
-                    // Look for administrative towns
-                    node["place"="town"](around:100000,${coordinates.lat},${coordinates.lon});
-                );
+            // Split queries for better parallel processing
+            const cityQuery = `
+                [out:json][timeout:30];
+                node["place"="city"](around:200000,${coordinates.lat},${coordinates.lon});
                 out body;
             `;
 
-            const cacheKey = `population_${coordinates.lat}_${coordinates.lon}`;
+            const townQuery = `
+                [out:json][timeout:30];
+                node["place"="town"](around:100000,${coordinates.lat},${coordinates.lon});
+                out body;
+            `;
 
-            const data = await this.fetchWithRetry(
-                () => this.queryOverpass(query),
-                cacheKey
-            );
+            // Execute queries in parallel
+            const [citiesData, townsData] = await Promise.all([
+                this.fetchWithRetry(
+                    () => this.queryOverpass(cityQuery),
+                    `cities_${coordinates.lat}_${coordinates.lon}`
+                ),
+                this.fetchWithRetry(
+                    () => this.queryOverpass(townQuery),
+                    `towns_${coordinates.lat}_${coordinates.lon}`
+                )
+            ]);
 
-            // Find cities and towns
-            const cities = data.elements.filter(el => el.tags.place === "city");
-            const capitalCity = cities.find(el => el.tags.capital === "yes" || el.tags.admin_level === "2");
+            // Process cities and towns in parallel
+            const [cityResults, townResults] = await Promise.all([
+                this.processCityData(coordinates, citiesData),
+                this.processTownData(coordinates, townsData)
+            ]);
 
-            const towns = data.elements.filter(el => el.tags.place === "town");
-            const adminTown = towns.find(el => el.tags.admin_level);
-
-            // If we can't find a specific capital or admin town, use the nearest city and town
-            const nearestCity = cities.length > 0 ?
-                this.findNearestPlace(coordinates, cities) : null;
-
-            const nearestTown = towns.length > 0 ?
-                this.findNearestPlace(coordinates, towns) : null;
-
-            return {
-                distance_to_city: capitalCity ?
-                    this.calculatePointDistance(coordinates, capitalCity) :
-                    (nearestCity ? this.calculatePointDistance(coordinates, nearestCity) : -1),
-
-                distance_to_town: adminTown ?
-                    this.calculatePointDistance(coordinates, adminTown) :
-                    (nearestTown ? this.calculatePointDistance(coordinates, nearestTown) : -1),
-
-                capitalCity,
-                nearestTown
+            const result = {
+                distance_to_city: cityResults.distance,
+                distance_to_town: townResults.distance,
+                capitalCity: cityResults.capital,
+                nearestTown: townResults.nearest
             };
+
+            // Cache the final result
+            this.overpassCache.set(cacheKey, result);
+            return result;
+
         } catch (error) {
             console.error("Population distance calculation failed:", error);
             return {
                 distance_to_city: -1,
-                distance_to_town: -1
+                distance_to_town: -1,
+                error: error.message
             };
         }
+    }
+
+    async processCityData(coordinates, data) {
+        const cities = data.elements || [];
+        
+        // Process capital cities first
+        const capitalCity = cities.find(el => 
+            el.tags.capital === "yes" || 
+            el.tags.admin_level === "2"
+        );
+
+        // Find nearest city using Web Workers if available
+        const nearestCity = await this.findNearestPlaceOptimized(coordinates, cities);
+
+        return {
+            distance: capitalCity ? 
+                this.calculatePointDistance(coordinates, capitalCity) :
+                (nearestCity ? this.calculatePointDistance(coordinates, nearestCity) : -1),
+            capital: capitalCity,
+            nearest: nearestCity
+        };
+    }
+
+    async processTownData(coordinates, data) {
+        const towns = data.elements || [];
+        
+        // Process admin towns first
+        const adminTown = towns.find(el => el.tags.admin_level);
+        
+        // Find nearest town using Web Workers if available
+        const nearestTown = await this.findNearestPlaceOptimized(coordinates, towns);
+
+        return {
+            distance: adminTown ?
+                this.calculatePointDistance(coordinates, adminTown) :
+                (nearestTown ? this.calculatePointDistance(coordinates, nearestTown) : -1),
+            admin: adminTown,
+            nearest: nearestTown
+        };
+    }
+
+    async findNearestPlaceOptimized(coordinates, places) {
+        if (!places || places.length === 0) return null;
+        
+        // For small arrays, use regular processing
+        if (places.length < 100) {
+            return this.findNearestPlace(coordinates, places);
+        }
+
+        // For larger arrays, use chunks for better performance
+        const chunkSize = 100;
+        const chunks = this.chunkArray(places, chunkSize);
+        
+        const nearestPerChunk = await Promise.all(
+            chunks.map(chunk => this.findNearestPlace(coordinates, chunk))
+        );
+
+        return this.findNearestPlace(coordinates, nearestPerChunk.filter(Boolean));
+    }
+
+    chunkArray(array, size) {
+        const chunks = [];
+        for (let i = 0; i < array.length; i += size) {
+            chunks.push(array.slice(i, i + size));
+        }
+        return chunks;
     }
 
     findNearestPlace(coordinates, places) {
@@ -643,16 +708,18 @@ class FarmRouteAnalyzer {
             // Validate input coordinates
             this.validateCoordinatesRefactored(coordinates);
 
-            // Calculate distances to different road types
-            const roadDistances = await this.calculateRoadDistances(coordinates);
+            // Run independent calculations in parallel
+            const [
+                roadDistances,
+                populationDistances,
+                primaryRoadInfo
+            ] = await Promise.all([
+                this.calculateRoadDistances(coordinates),
+                this.calculatePopulationDistances(coordinates),
+                this.findNearestPrimaryRoadPoint(coordinates)
+            ]);
 
-            // Calculate distances to population centers
-            const populationDistances = await this.calculatePopulationDistances(coordinates);
-
-            // Add route information for the critical segment (field to primary road)
-            const primaryRoadInfo = await this.findNearestPrimaryRoadPoint(coordinates);
-
-            // Only add route data if we found a primary road
+            // Only calculate route if primary road was found
             let routeData = {};
             if (primaryRoadInfo.point) {
                 const route = await this.calculateRealRouteWithCache(coordinates, primaryRoadInfo.point);
@@ -765,7 +832,6 @@ class FarmRouteAnalyzer {
      * @returns {Object} Hazard information for different road segments
      */
     async calculateHazardsForRoads(coordinates, metrics) {
-        // Initialize hazards object with default structure
         const hazards = {
             critical_segment: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
             secondary: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 },
@@ -774,199 +840,113 @@ class FarmRouteAnalyzer {
             town: { bridges: 0, water_crossings: 0, landslides: 0, risk_score: 0 }
         };
 
-        // Configuration constants
-        const TIMEOUT = 15000; // 15 second timeout for external API calls
-        const MAX_RETRIES = 2;  // Maximum number of retries for failed operations
+        const TIMEOUT = 15000;
+        const MAX_RETRIES = 2;
 
-        // Create a timeout promise
-        const createTimeout = (ms) => {
-            return new Promise((_, reject) => {
-                setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms);
-            });
-        };
-
-        // Execute promise with timeout and retry logic
-        const withTimeoutAndRetry = async (promiseFn, ms, retries = 0) => {
-            try {
-                return await Promise.race([promiseFn(), createTimeout(ms)]);
-            } catch (error) {
-                if (retries < MAX_RETRIES) {
-                    console.warn(`Retrying operation (${retries + 1}/${MAX_RETRIES})...`);
-                    return withTimeoutAndRetry(promiseFn, ms, retries + 1);
+        const executeWithRetry = async (operation, label) => {
+            for (let i = 0; i < MAX_RETRIES; i++) {
+                try {
+                    return await Promise.race([
+                        operation(),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout`)), TIMEOUT))
+                    ]);
+                } catch (error) {
+                    if (i === MAX_RETRIES - 1) throw error;
+                    await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
                 }
-                throw error;
             }
         };
 
         try {
-            // Validate input parameters
-            if (!coordinates || !coordinates.lat || !coordinates.lon) {
-                throw new Error("Invalid coordinates provided");
+            if (!coordinates?.lat || !coordinates?.lon || !metrics) {
+                throw new Error("Invalid input parameters");
             }
 
-            if (!metrics || typeof metrics !== 'object') {
-                throw new Error("Invalid metrics object provided");
-            }
+            // Parallel processing of road points and routes
+            const roadAnalysis = await Promise.all([
+                // Primary road analysis
+                executeWithRetry(async () => {
+                    const primaryInfo = await this.findNearestPrimaryRoadPoint(coordinates);
+                    if (!primaryInfo?.point) return null;
+                    
+                    const route = await this.calculateRealRouteWithCache(coordinates, primaryInfo.point);
+                    const hazardAnalysis = await this.queryHazards(route.features[0].geometry);
+                    
+                    return {
+                        type: 'primary',
+                        distance: primaryInfo.distance,
+                        hazards: hazardAnalysis,
+                        geometry: route.features[0].geometry
+                    };
+                }, "Primary road analysis"),
 
-            // Find nearest primary road point with timeout and retry
-            const primaryRoadInfo = await withTimeoutAndRetry(
-                () => this.findNearestPrimaryRoadPoint(coordinates),
-                TIMEOUT
-            );
+                // Secondary and tertiary road analysis (in parallel)
+                ...['secondary', 'tertiary'].map(roadType => 
+                    executeWithRetry(async () => {
+                        if (metrics[`distance_to_${roadType}`] <= 0) return null;
 
-            if (!primaryRoadInfo || !primaryRoadInfo.point) {
-                throw new Error("No primary road found within search radius");
-            }
+                        const nearestPoint = await this.findNearestRoadPoint(coordinates, roadType);
+                        if (!nearestPoint) return null;
 
-            // Get actual route from field to primary road
-            const primaryRoutePromise = withTimeoutAndRetry(
-                () => this.calculateRealRouteWithCache(coordinates, primaryRoadInfo.point),
-                TIMEOUT
-            );
-
-            // Prepare promises for secondary and tertiary roads in parallel
-            const roadPromises = [];
-            const roadTypes = ['secondary', 'tertiary'];
-
-            for (const roadType of roadTypes) {
-                // Only analyze if this road type exists and is closer than primary
-                if (metrics[`distance_to_${roadType}`] > 0 &&
-                    metrics[`distance_to_${roadType}`] < primaryRoadInfo.distance) {
-
-                    roadPromises.push(
-                        withTimeoutAndRetry(() => this.findNearestRoadPoint(coordinates, roadType), TIMEOUT)
-                            .then(nearestPoint => {
-                                if (!nearestPoint) return null;
-                                return {
-                                    type: roadType,
-                                    point: nearestPoint,
-                                    routePromise: withTimeoutAndRetry(
-                                        () => this.calculateRealRouteWithCache(coordinates, nearestPoint),
-                                        TIMEOUT
-                                    )
-                                };
-                            })
-                            .catch(err => {
-                                console.warn(`Error finding ${roadType} road:`, err);
-                                return null;
-                            })
-                    );
-                } else {
-                    roadPromises.push(Promise.resolve(null));
-                }
-            }
-
-            // Wait for all road points to be found
-            const [primaryRoute, ...otherRoads] = await Promise.all([
-                primaryRoutePromise,
-                ...roadPromises
-            ]);
-
-            // Validate primary route data
-            if (!primaryRoute || !primaryRoute.features || !primaryRoute.features[0] ||
-                !primaryRoute.features[0].geometry) {
-                throw new Error("Invalid primary route data returned from routing service");
-            }
-
-            // Extract route geometry and analyze primary road hazards
-            const primaryRouteGeometry = primaryRoute.features[0].geometry;
-            const primaryHazardAnalysis = await withTimeoutAndRetry(
-                () => this.queryHazards(primaryRouteGeometry),
-                TIMEOUT
-            );
-
-            // Validate hazard analysis data
-            if (!primaryHazardAnalysis ||
-                !Array.isArray(primaryHazardAnalysis.bridges) ||
-                !Array.isArray(primaryHazardAnalysis.water) ||
-                !Array.isArray(primaryHazardAnalysis.landslides)) {
-                throw new Error("Invalid hazard analysis data for primary route");
-            }
-
-            // Store hazard information for the critical segment
-            hazards.critical_segment = {
-                distance: primaryRoadInfo.distance,
-                bridges: primaryHazardAnalysis.bridges.length,
-                water_crossings: primaryHazardAnalysis.water.length,
-                landslides: primaryHazardAnalysis.landslides.length,
-                risk_score: this.calculateCompositeRisk(primaryHazardAnalysis)
-            };
-
-            // Process other road types in parallel with error handling for each
-            const hazardPromises = otherRoads
-                .filter(road => road !== null)
-                .map(async (road) => {
-                    try {
-                        const route = await road.routePromise;
-
-                        // Validate route data
-                        if (!route || !route.features || !route.features[0] || !route.features[0].geometry) {
-                            throw new Error(`Invalid route data for ${road.type} road`);
-                        }
-
-                        const routeGeom = route.features[0].geometry;
-                        const roadHazards = await withTimeoutAndRetry(
-                            () => this.queryHazards(routeGeom),
-                            TIMEOUT
-                        );
-
-                        // Validate hazard data
-                        if (!roadHazards ||
-                            !Array.isArray(roadHazards.bridges) ||
-                            !Array.isArray(roadHazards.water) ||
-                            !Array.isArray(roadHazards.landslides)) {
-                            throw new Error(`Invalid hazard data for ${road.type} road`);
-                        }
+                        const route = await this.calculateRealRouteWithCache(coordinates, nearestPoint);
+                        const hazardAnalysis = await this.queryHazards(route.features[0].geometry);
 
                         return {
-                            type: road.type,
-                            hazardData: {
-                                bridges: roadHazards.bridges.length,
-                                water_crossings: roadHazards.water.length,
-                                landslides: roadHazards.landslides.length,
-                                risk_score: this.calculateCompositeRisk(roadHazards)
-                            }
+                            type: roadType,
+                            hazards: hazardAnalysis,
+                            geometry: route.features[0].geometry
                         };
-                    } catch (err) {
-                        console.warn(`Error processing ${road.type} road:`, err);
-                        return {
-                            type: road.type,
-                            hazardData: {
-                                bridges: 0,
-                                water_crossings: 0,
-                                landslides: 0,
-                                risk_score: 0,
-                                error: err.message
-                            }
-                        };
+                    }, `${roadType} road analysis`)
+                )
+            ].filter(Boolean));
+
+            // Process results in parallel using Web Workers if available
+            const processResults = roadAnalysis.map(async analysis => {
+                if (!analysis) return null;
+
+                const hazardCounts = {
+                    bridges: analysis.hazards.bridges.length,
+                    water_crossings: analysis.hazards.water.length,
+                    landslides: analysis.hazards.landslides.length
+                };
+
+                return {
+                    type: analysis.type,
+                    data: {
+                        ...hazardCounts,
+                        risk_score: this.calculateCompositeRisk(analysis.hazards),
+                        distance: analysis.distance
                     }
-                });
+                };
+            });
 
-            // Wait for all hazard analyses to complete
-            const hazardResults = await Promise.allSettled(hazardPromises);
+            const results = await Promise.all(processResults);
 
-            // Assign results to appropriate road types
-            hazardResults.forEach(result => {
-                if (result.status === 'fulfilled' && result.value) {
-                    hazards[result.value.type] = result.value.hazardData;
+            // Update hazards object with processed results
+            results.forEach(result => {
+                if (!result) return;
+
+                if (result.type === 'primary') {
+                    hazards.critical_segment = result.data;
+                    hazards.city = result.data;  // Use critical segment for city/town
+                    hazards.town = result.data;
+                } else {
+                    hazards[result.type] = result.data;
                 }
             });
 
-            // For cities and towns, use the critical segment hazards
-            // This is intentional as we're focusing on the field-to-main-road segment
-            hazards.city = hazards.critical_segment;
-            hazards.town = hazards.critical_segment;
-
             return hazards;
+
         } catch (error) {
-            console.error("Error calculating hazards:", error);
-
-            // Add error information to critical segment
-            hazards.critical_segment.error = error.message;
-            hazards.critical_segment.error_type = error.name;
-            hazards.critical_segment.error_stack = process.env.NODE_ENV === 'development' ? error.stack : undefined;
-
-            return hazards;
+            console.error("Hazard calculation error:", error);
+            return {
+                ...hazards,
+                critical_segment: {
+                    ...hazards.critical_segment,
+                    error: error.message,
+                    error_type: error.name
+                }
+            };
         }
     }
 

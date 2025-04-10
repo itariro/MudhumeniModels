@@ -197,8 +197,7 @@ class AgriculturalLandAnalyzer {
 
             // Perform comprehensive analysis
             const analysis = await this.performAnalysis(geoJson, transformedElevationData);
-            console.log('Analysis:', analysis);
-
+            console.log('Analysis completed successfully');
             logger.info('Analysis completed successfully');
             return analysis;
         } catch (error) {
@@ -443,7 +442,7 @@ class AgriculturalLandAnalyzer {
     static async performAnalysis(geoJson, elevationData) {
         const area = turf.area(geoJson);
         this.POLYGON_AREA = area;
-        
+
         // 1. Prepare elevation data points
         const points = elevationData.map(d => ({
             type: 'Feature',
@@ -466,10 +465,10 @@ class AgriculturalLandAnalyzer {
         console.log('Terrain analysis completed:');
         // Assess crop suitability
         const cropSuitability = this.assessCropSuitability(slopeStats, terrainAnalysis);
-        console.log('Crop suitability:', cropSuitability);
+        console.log('Crop suitability completed');
         // Calculate ROI factors
         const roiAnalysis = this.calculateROIFactors(area, slopeStats, terrainAnalysis);
-        console.log('ROI analysis:', roiAnalysis);
+        console.log('ROI analysis completed');
         return {
             areaCharacteristics: {
                 totalArea: area,
@@ -1411,9 +1410,6 @@ class AgriculturalLandAnalyzer {
             drainageAdjustment *
             erosionAdjustment;
 
-        console.log('slopeSuitability:', slopeSuitability, 'elevationSuitability:', elevationSuitability, 'drainageAdjustment:', drainageAdjustment, 'erosionAdjustment:', erosionAdjustment);
-        console.log('score:', score);
-
         return {
             score,
             category: this.classifySuitability(score),
@@ -1943,44 +1939,94 @@ class AgriculturalLandAnalyzer {
         switch (className) {
             case 'EXCEPTIONAL':
                 recommendations.push({
-                    focus: 'Maintenance',
+                    focus: 'Maintenance & Optimization',
                     priority: 'High',
-                    action: 'Maintain current management practices',
-                    timeframe: 'Ongoing'
+                    actions: [
+                        'Maintain current management practices and monitoring systems',
+                        'Document successful practices for knowledge transfer',
+                        'Consider precision agriculture technologies for further optimization'
+                    ],
+                    timeframe: 'Ongoing',
+                    expectedOutcomes: 'Sustained high yields and optimal resource efficiency',
+                    monitoringNeeds: 'Regular soil testing, yield monitoring, and nutrient tracking'
                 });
                 break;
+
             case 'HIGH':
                 recommendations.push({
-                    focus: 'Optimization',
+                    focus: 'Strategic Enhancement',
                     priority: 'Medium',
-                    action: 'Fine-tune management practices',
-                    timeframe: 'Quarterly'
+                    actions: [
+                        'Implement precision farming techniques',
+                        'Optimize irrigation and nutrient management',
+                        'Develop comprehensive soil health program',
+                        'Consider crop rotation optimization'
+                    ],
+                    timeframe: 'Quarterly',
+                    expectedOutcomes: 'Increased yield stability and resource use efficiency',
+                    monitoringNeeds: 'Quarterly soil and crop health assessments'
                 });
                 break;
+
             case 'MODERATE':
                 recommendations.push({
-                    focus: 'Enhancement',
+                    focus: 'Systematic Improvement',
                     priority: 'High',
-                    action: 'Implement targeted improvements',
-                    timeframe: 'Monthly'
+                    actions: [
+                        'Conduct detailed soil analysis and amendment program',
+                        'Implement erosion control measures',
+                        'Upgrade irrigation systems if applicable',
+                        'Review and optimize crop selection'
+                    ],
+                    timeframe: 'Monthly',
+                    expectedOutcomes: 'Significant yield improvements within 1-2 growing seasons',
+                    monitoringNeeds: 'Monthly progress assessments and soil condition monitoring'
                 });
                 break;
+
             case 'LOW':
                 recommendations.push({
-                    focus: 'Rehabilitation',
+                    focus: 'Intensive Rehabilitation',
                     priority: 'Urgent',
-                    action: 'Major management changes required',
-                    timeframe: 'Immediate'
+                    actions: [
+                        'Complete soil restoration program',
+                        'Install essential water management infrastructure',
+                        'Implement comprehensive erosion control',
+                        'Consider temporary land use change during rehabilitation',
+                        'Develop phased improvement plan'
+                    ],
+                    timeframe: 'Immediate',
+                    expectedOutcomes: 'Gradual productivity improvement over 2-3 years',
+                    monitoringNeeds: 'Bi-weekly monitoring of rehabilitation progress'
                 });
                 break;
+
             case 'MARGINAL':
                 recommendations.push({
-                    focus: 'Evaluation',
+                    focus: 'Strategic Reassessment',
                     priority: 'Critical',
-                    action: 'Reassess land use options',
-                    timeframe: 'Immediate'
+                    actions: [
+                        'Conduct comprehensive land capability assessment',
+                        'Evaluate alternative land use options',
+                        'Assess economic viability of major improvements',
+                        'Consider conservation or non-agricultural use',
+                        'Develop long-term land management strategy'
+                    ],
+                    timeframe: 'Immediate',
+                    expectedOutcomes: 'Identification of sustainable land use alternatives',
+                    monitoringNeeds: 'Monthly evaluation of land condition and improvement feasibility'
                 });
                 break;
+        }
+
+        // Add score-specific additional recommendations
+        if (score < 0.3) {
+            recommendations.push({
+                focus: 'Risk Mitigation',
+                priority: 'High',
+                actions: ['Implement erosion control', 'Establish ground cover'],
+                timeframe: 'Immediate'
+            });
         }
 
         return recommendations;

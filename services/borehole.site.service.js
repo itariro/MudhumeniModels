@@ -880,8 +880,6 @@ class BoreholeSiteService {
                 this.calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold)
             ]);
 
-            console.log('events -> ', events, 'efficiency -> ', efficiency);
-
             // Add fallback if no recharge events were found but rainfall exists
             if (events.length === 0 && precipData.some(record => record.rain > 0)) {
                 logger.warn('No recharge events identified despite rainfall. Using fallback method.');
@@ -1028,13 +1026,7 @@ class BoreholeSiteService {
      * calculateRechargeEfficiency([{dt: 123, rain: 15}], {'0': 10}, 12)
      */
     static calculateRechargeEfficiency(precipData, monthlyAverages, rechargeThreshold) {
-        console.log('Recharge efficiency calculation:', {
-            precipDataLength: precipData.length,
-            rechargeThreshold: rechargeThreshold,
-            hasRainfall: precipData.some(record => record.rain > 0),
-            maxRainfall: Math.max(...precipData.map(record => record.rain || 0))
-        });
-
+        
         // Check if there's any rainfall
         const hasRainfall = precipData.some(record => record.rain > 0);
         if (!hasRainfall) {
@@ -1465,8 +1457,6 @@ class BoreholeSiteService {
                 geologicalFeatures,
                 lithologicalData
             };
-
-            console.log('FIELD_ELEVATION:', AgriculturalLandAnalyzer.FIELD_ELEVATION.MEAN);
 
             // Calculate individual scores for each factor
             const scores = {
