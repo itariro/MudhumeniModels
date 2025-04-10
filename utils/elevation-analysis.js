@@ -463,7 +463,7 @@ class AgriculturalLandAnalyzer {
         const slopeStats = this.calculateSlopeStatistics(elevationSurface);
         // Analyze terrain characteristics
         const terrainAnalysis = this.analyzeTerrainCharacteristics(elevationSurface, slopeStats);
-        console.log('Terrain analysis:', terrainAnalysis);
+        console.log('Terrain analysis completed:');
         // Assess crop suitability
         const cropSuitability = this.assessCropSuitability(slopeStats, terrainAnalysis);
         console.log('Crop suitability:', cropSuitability);
