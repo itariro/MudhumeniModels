@@ -172,7 +172,9 @@ class AgriculturalLandAnalyzer {
                 throw new Error('Invalid GeoJSON polygon input');
             }
 
+
             // Generate sampling points within the polygon
+            console.log('Generated sampling points...');
             const samplingPoints = this.generateSamplingPoints(geoJson);
 
             console.log('Fetching elevation data...');
@@ -185,6 +187,8 @@ class AgriculturalLandAnalyzer {
                 .filter(item => item.status === "fulfilled")
                 .flatMap(item => item.value.elevation);
 
+            console.log(elevations);
+
             const { mean, median, min, max } = StatisticsUtils;
 
             this.FIELD_ELEVATION = {
@@ -193,11 +197,11 @@ class AgriculturalLandAnalyzer {
                 MIN: parseFloat(min(elevations)),
                 MAX: parseFloat(max(elevations))
             };
-            console.log('Elevation data:', this.FIELD_ELEVATION);
 
             // Perform comprehensive analysis
+            console.log('Performing deep analysis...');
             const analysis = await this.performAnalysis(geoJson, transformedElevationData);
-            console.log('Analysis completed successfully');
+            console.log('Analysis completed successfully...');
             logger.info('Analysis completed successfully');
             return analysis;
         } catch (error) {
@@ -267,18 +271,32 @@ class AgriculturalLandAnalyzer {
         }
 
         const area = turf.area(geoJson);
-        const MAX_POINTS_PER_CHUNK = 1000;
-        const GRID_SPACING = 10; // 10 meters
+        const MAX_TOTAL_POINTS = 100;
 
+        // Calculate optimal grid spacing based on area
+        // Square root of (area / desired points) gives average spacing needed
+        const optimalSpacing = Math.sqrt(area / MAX_TOTAL_POINTS);
+
+        // Adjust spacing to ensure good coverage (minimum 10m, maximum 500m)
+        const GRID_SPACING = Math.max(10, Math.min(500, optimalSpacing));
+
+        // For large areas, divide into chunks
         if (area > 1000000) { // 1 km²
             const chunks = this.divideIntoChunks(geoJson);
+            // Distribute points proportionally among chunks
+            const pointsPerChunk = Math.floor(MAX_TOTAL_POINTS / chunks.length);
+
             return chunks.reduce((points, chunk) => {
-                const chunkPoints = this.generateGridPoints(chunk, GRID_SPACING, MAX_POINTS_PER_CHUNK);
+                const chunkArea = turf.area(chunk);
+                const chunkSpacing = Math.sqrt(chunkArea / pointsPerChunk);
+                const adjustedSpacing = Math.max(10, Math.min(500, chunkSpacing));
+
+                const chunkPoints = this.generateGridPoints(chunk, adjustedSpacing, pointsPerChunk);
                 return turf.featureCollection([...points.features, ...chunkPoints.features]);
             }, turf.featureCollection([]));
         }
 
-        return this.generateGridPoints(geoJson, GRID_SPACING, MAX_POINTS_PER_CHUNK);
+        return this.generateGridPoints(geoJson, GRID_SPACING, MAX_TOTAL_POINTS);
     }
 
     static generateGridPoints(polygon, spacing, maxPoints) {
